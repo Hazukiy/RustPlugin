@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenMod.Rust.Oxide" Version="3.3.2" />
+    <PackageReference Include="Oxide" Version="1.0.0" />
+  </ItemGroup>
+
+  <Target Name="PostBuild" AfterTargets="PostBuildEvent">
+    <Exec Command="xcopy &quot;$(SolutionDir)\MyRustPlugin\MyRustPlugin.cs&quot; &quot;C:\Gameservers\Rust\oxide\plugins&quot; /Y /S" />
+  </Target>
+
+</Project>
