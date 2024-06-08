@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <RootNamespace>ZombieMod</RootNamespace>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenMod.Core" Version="3.8.7" />
+    <PackageReference Include="OpenMod.Rust" Version="3.8.7" />
+    <PackageReference Include="OpenMod.Rust.Oxide" Version="3.8.7" />
+    <PackageReference Include="OpenMod.Rust.Oxide.Extension" Version="2.3.8" />
+    <PackageReference Include="OpenMod.Rust.Oxide.PermissionLink" Version="3.8.7" />
+    <PackageReference Include="OpenMod.Rust.Oxide.Redist" Version="2.0.4765" />
+    <PackageReference Include="OpenMod.Rust.Redist" Version="2260.199.1" />
+    <PackageReference Include="OpenMod.UnityEngine" Version="3.8.7" />
+    <PackageReference Include="OpenMod.UnityEngine.Redist" Version="2021.3.29.1" />
+    <PackageReference Include="Oxide" Version="1.0.0" />
+  </ItemGroup>
+
+  <Target Name="PreBuild" BeforeTargets="PreBuildEvent">
+    <Exec Command="xcopy &quot;$(SolutionDir)\28YearsLater\ZombieMod.cs&quot; &quot;C:\RustServer\oxide\plugins&quot; /Y /S" />
+  </Target>
+
+</Project>

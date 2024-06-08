@@ -8,6 +8,11 @@ using Rust;
 using UnityEngine;
 using Oxide.Core.Libraries.Covalence;
 using System.Collections.Generic;
+using Random = UnityEngine.Random;
+using System.Collections;
+using Physics = UnityEngine.Physics;
+using ConVar;
+using Pool = Facepunch.Pool;
 
 namespace Oxide.Plugins
 {
@@ -39,6 +44,7 @@ namespace Oxide.Plugins
             // Register the chat command
             cmd.AddChatCommand("time", this, nameof(TimeCommand));
             cmd.AddChatCommand("voteday", this, nameof(VoteDay));
+            cmd.AddChatCommand("zombie", this, nameof(SpawnZombieCommand));
         }
 
         #region Server Hooks
@@ -89,6 +95,11 @@ namespace Oxide.Plugins
         private void TimeCommand(BasePlayer player, string command, string[] args)
         {
             Player.Message(player, $"Server time is now: {GetFormattedMsg($"{TOD_Sky.Instance.Cycle.DateTime:hh:mm} {TOD_Sky.Instance.Cycle.DateTime:tt}", Red)}", Prefix, ShowIcon);
+        }
+
+        private void SpawnZombieCommand(BasePlayer player, string command, string[] args)
+        {
+            SpawnZombie(player);
         }
 
         private void VoteDay(BasePlayer player, string command, string[] args)
@@ -162,9 +173,70 @@ namespace Oxide.Plugins
         }
         #endregion
 
+        #region Zombie Spawning
+        private const string _zombiePrefab = "assets/prefabs/npc/scarecrow/scarecrow.prefab";
+        private readonly int _spawnLayerMask = LayerMask.GetMask("Default", "Tree", "Construction", "World", "Vehicle_Detailed", "Deployed");
+
+
+        private void SpawnZombie(BasePlayer player)
+        {
+            Vector3 position = GetRandomPositionAroundPlayer(player);
+
+            ScarecrowNPC zombie = GameManager.server.CreateEntity(_zombiePrefab, position) as ScarecrowNPC;
+            if (!zombie)
+            {
+                return;
+            }
+            
+            zombie.Spawn();        
+            zombie.displayName = "Kieran";
+
+            if (zombie.TryGetComponent(out BaseNavigator navigator))
+            {
+                navigator.ForceToGround();
+                navigator.PlaceOnNavMesh(0);
+            }
+
+            //Initialise health
+            float health = 200.0f;
+            zombie.SetMaxHealth(health);
+            zombie.SetHealth(health);
+        }
+
+        private Vector3 GetRandomPositionAroundPlayer(BasePlayer player)
+        {
+            Vector3 playerPos = player.transform.position;
+            Vector3 position = Vector3.zero;
+
+            for (int i = 0; i < 6; i++)
+            {
+                position = new Vector3(Random.Range(playerPos.x - 20.0f, playerPos.x + 20.0f), 0, Random.Range(playerPos.z - 20.0f, playerPos.z + 20.0f));
+                position.y = TerrainMeta.HeightMap.GetHeight(position);
+
+                // If valid position
+                if (!AntiHack.TestInsideTerrain(position) && !IsInObject(position) && !IsInOcean(position) && 
+                    Vector3.Distance(playerPos, position) > 10.0f)
+                {
+                    break;
+                }
+            }
+            return position;
+        }
+
+        private bool IsInObject(Vector3 position)
+        {
+            return Physics.OverlapSphere(position, 0.5f, _spawnLayerMask).Length > 0;
+        }
+
+        private bool IsInOcean(Vector3 position)
+        {
+            return WaterLevel.GetWaterDepth(position, true) > 0.25f;
+        }
+
+        #endregion
+
+
         private string GetFormattedMsg(string msg, string colour = Blue) => $"<color={colour}>{msg}</color>";
-
-
 
         internal class PlayerData
         {
