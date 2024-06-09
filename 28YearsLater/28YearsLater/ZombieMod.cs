@@ -34,7 +34,7 @@ namespace Oxide.Plugins
         private const string Blue = "#32a4f5";
         private const string Green = "#1cbf68";
         private const string Red = "#DE0F17";
-        private string Prefix = $"<color={Green}>[ZM]</color> ";
+        private string Prefix = $"<color={Red}>[ZM]</color> ";
 
         private const int ShowIcon = 0;
         private const int ReportTimeDelay = 300; // 600 = 10 minutes 
@@ -61,19 +61,32 @@ namespace Oxide.Plugins
             cmd.AddChatCommand("zclear", this, nameof(ClearZombiesCommand));
             cmd.AddChatCommand("zpop", this, nameof(GetZombieCountCommand));
             cmd.AddChatCommand("zre", this, nameof(RegenerateZombiesCommand));
+            cmd.AddChatCommand("zradius", this, nameof(GetZombieRadiusCountCommand));
         }
 
         #region Server Hooks
         private void OnServerInitialized()
         {
             // Initial map zombie spawning
-            StartMapSpawning();
+            //StartMapSpawning(ZombieInitalAmount);
 
             // Broadcast the server time
             timer.Every(ReportTimeDelay, () =>
             {
                 Server.Broadcast($"Server time is now: {MsgFmt($"{TOD_Sky.Instance.Cycle.DateTime:hh:mm} {TOD_Sky.Instance.Cycle.DateTime:tt}", Red)}", Prefix);
             });
+
+            // Rebuild all players
+            foreach (BasePlayer player in BasePlayer.activePlayerList)
+            {
+                BuildPlayer(player);
+            }
+
+            // Build map
+            if (_zombieSpawnTimer == null)
+            {
+                _zombieSpawnTimer = timer.Every(120.0f, () => OnSpawnZombie());
+            }
         }
 
         private void OnPlayerConnected(BasePlayer player)
@@ -81,10 +94,27 @@ namespace Oxide.Plugins
             Player.Message(player, MsgFmt($"Commands: (/time, /voteday)"), Prefix);
             Server.Broadcast($"{MsgFmt($"{player.displayName}", Green)} has connected.", Prefix);
 
-            // TODO: Add radius check, X amount per sq of zombies to prevent over-spawning
+            BuildPlayer(player);
+        }
 
-            // Spawn zombies around player
-            StartPlayerSpawning(player);
+        private void BuildPlayer(BasePlayer player)
+        {
+            //_zombiePlayerSpawnTimer = timer.Every(20.0f, () => OnCheckZombieRadius(player));
+
+        }
+
+        void OnUserConnected(IPlayer player)
+        {
+            Puts($"{player.Name} ({player.Id}) connected from {player.Address}");
+
+            if (player.IsAdmin)
+            {
+                Puts($"{player.Name} ({player.Id}) is admin");
+            }
+
+            Puts($"{player.Name} is {(player.IsBanned ? "banned" : "not banned")}");
+
+            Server.Broadcast($"Welcome {player.Name} to pain");
         }
 
         private void OnPlayerDisconnected(BasePlayer player)
@@ -96,7 +126,7 @@ namespace Oxide.Plugins
         {
             if (info.Initiator is ScarecrowNPC)
             {
-                Server.Broadcast(MsgFmt($"{player.displayName} {_deathReasons[Random.Range(0, _deathReasons.Count)]}"), Prefix);
+                Server.Broadcast($"{MsgFmt($"{player.displayName}")} {_deathReasons[Random.Range(0, _deathReasons.Count)]}", Prefix);
             }
 
             return null;
@@ -114,9 +144,27 @@ namespace Oxide.Plugins
 
         private void OnPlayerRespawned(BasePlayer player)
         {
+            if (player.IsConnected)
+            {
+                var zombiesInRadius = GetEntitiesWithinRadius(player.transform.position, ZombieSpawnRadius, ZombiePrefabID);
+                if (zombiesInRadius.Count >= ZombieMaxPerRadius)
+                {
+                    return;
+                }
+
+                var amountToSpawn = ZombieMaxPerRadius - zombiesInRadius.Count;
+                if (amountToSpawn > 0)
+                {
+                    StartPlayerSpawning(player, amountToSpawn);
+                }
+            }
+
             //Puts($"Player {player.displayName} ({player.userID}) has spawned.");
             //timer.Every(1f, (() => RenderUI(player)));
         }
+
+
+
         #endregion
 
         #region Generic Commands
@@ -201,13 +249,13 @@ namespace Oxide.Plugins
         private const string ZombiePrefab = "assets/prefabs/npc/scarecrow/scarecrow.prefab";
         private const uint ZombiePrefabID = 3473349223;
         private const uint PlayerPrefabID = 4108440852;
-        private const int GrenadeItemID = 1840822026;
         private readonly int SpawnLayerMask = LayerMask.GetMask("Default", "Tree", "Construction", "World", "Vehicle_Detailed", "Deployed");
+
+        // Zombie feature setup
         private List<string> _zombieWeapons = new List<string>()
         {
             "knife.butcher"
-        };
-        
+        };  
         private List<string> _zombieNames = new List<string>
         {
             "Rotten Rick",
@@ -261,7 +309,6 @@ namespace Oxide.Plugins
             "Wretched Wayne",
             "Phantom Phil"
         };
-
         private List<string> _deathReasons = new List<string>()
         {
             "Tried to give a zombie a high five and became the appetizer",
@@ -321,59 +368,99 @@ namespace Oxide.Plugins
             "Tried to teach zombies how to do the cha-cha and got chomped instead",
             "Thought zombies were just trying to play 'Tag' and joined the game",
         };
+        private List<string> _zombieEnterPhase = new List<string>()
+        {
+            "An outbreak at an encampment caused {#} new zombies",
+            "{#} zombies have entered the city",
+            "A hospital has become overrun, creating {#} new zombies",
+            "A camp of bandits have become overwhelmed, creating {#} new zombies",
+            "{#} zombies emerged from the graveyard",
+            "A quarantine breach has resulted in {#} new zombies",
+            "A laboratory accident spawned {#} zombies",
+            "{#} new zombies appeared from the forest",
+            "A suburban neighborhood fell, adding {#} zombies",
+            "{#} zombies rose after a failed military operation",
+            "A shopping mall siege resulted in {#} zombies",
+            "A school evacuation turned into chaos, making {#} new zombies",
+            "{#} zombies emerged from a deserted highway",
+            "An apartment complex outbreak created {#} zombies",
+            "A research facility meltdown unleashed {#} zombies",
+            "{#} zombies broke through the town's defenses",
+            "A rural village succumbed, resulting in {#} zombies",
+            "{#} new zombies came from an abandoned mine",
+            "A cruise ship infestation led to {#} new zombies",
+            "{#} zombies appeared after a prison riot"
+        };
 
         // Zombie radius options
-        private const float MinPlayerSpawnDistance = 60.0f;
-        private const float MaxPlayerSpawnDistance = 150.0f;
+        private const float MinPlayerSpawnDistance = 90.0f;
+        private const float MaxPlayerSpawnDistance = 200.0f;
 
-        // Spawn limits
-        private const int MaxZombies = 5000;
-        private const int MaxPerPlayer = 1;
-        private int MaxPerInitMap = 50;
+        private Timer _zombieSpawnTimer;
+        private Timer _zombiePlayerSpawnTimer;
+
+        // Zombie Spawn limits
+        private const int MaxZombies = 1500;
+        private const int MaxPerPlayer = 5;
+        private int ZombieInitalAmount = 50;
+        private int ZombieRefreshAmount = 20;
+        private int ZombieMinThreshold = 5;
+
+        // Zombie Radius
+        private float ZombieSpawnRadius = 100.0f;
+        private int ZombieMaxPerRadius = 10;
 
         // Zombie properties
-        private const float ZombieHealth = 20.0f;
-        private int ZombieScrapCap = 50;
+        private const float ZombieMinHealth = 50.0f;
+        private const float ZombieMaxHealth = 150.0f;
+        private int ZombieScrapCap = 20;
 
         // Globals
         private int _totalKilledZombies;
 
         public int TotalZombiesOnMap => GetEntitiesByPrefabId(ZombiePrefabID).Count;
 
-        private void StartMapSpawning()
+        private void StartMapSpawning(int amount)
         {
             if (!EnableZombies) return;
 
-            Server.Broadcast($"Starting zombie spawning...", Prefix);
+            Puts($"Starting map zombie spawning...");
 
-            // Check the count from pref type
-            var allZombies = GetEntitiesByPrefabId(ZombiePrefabID);
-            if (allZombies.Count >= MaxPerInitMap)
+            if (TotalZombiesOnMap >= MaxZombies)
             {
-                // Skip rendering if there's already loads on the map
-                Puts("Skipping map spawning as more than half are already spawned");
+                Puts("Max zombie population limit reached; skipping map spawning.");
                 return;
             }
 
-            for (var i = 0; i < MaxPerInitMap; i++)
+            for (var i = 0; i < amount; i++)
             {
                 Vector3 pos = GetRandomPosition();
                 SpawnZombie(pos);
             }
+            Puts($"Finished map spawning {amount} zombies.");
 
-            Server.Broadcast($"Finished zombie spawning.", Prefix);
+            var phrase = _zombieEnterPhase[Random.Range(0, _zombieEnterPhase.Count)];
+            phrase = phrase.Replace("{#}", $"{MsgFmt($"{amount}", Green)}");
+
+            Server.Broadcast(phrase, Prefix);
         }
 
-        public void StartPlayerSpawning(BasePlayer player)
+        public void StartPlayerSpawning(BasePlayer player, int amount)
         {
             if (!EnableZombies) return;
 
-            for (var i = 0; i < MaxPerPlayer; i++)
+            for (var i = 0; i < amount; i++)
             {
                 Vector3 pos = GetRandomPositionAroundPlayer(player);
                 SpawnZombie(pos);
             }
         }
+
+        //object OnConstructionPlace(BaseEntity entity, Construction component, Construction.Target constructionTarget, BasePlayer player)
+        //{
+        //    Puts("OnConstructionPlace works!");
+        //    return true;
+        //}
 
         public void SpawnZombie(Vector3 pos)
         {
@@ -399,8 +486,9 @@ namespace Oxide.Plugins
             }
 
             // Set health
-            zombie.SetMaxHealth(ZombieHealth);
-            zombie.SetHealth(ZombieHealth);
+            var health = Random.Range(ZombieMinHealth, ZombieMaxHealth);
+            zombie.SetMaxHealth(health);
+            zombie.SetHealth(health);
 
             // Clear inventory
             ItemContainer inventory = zombie.inventory.containerBelt as ItemContainer;
@@ -410,7 +498,6 @@ namespace Oxide.Plugins
             var itemDef = ItemManager.FindItemDefinition("knife.butcher");
             if (itemDef != null)
             {
-                //inventory.itemList.Add(knife);
                 var zomObj = zombie as BaseCombatEntity;
                 Item weaponItem = ItemManager.CreateByItemID(itemDef.itemid, 1, 0);
                 zomObj.GiveItem(weaponItem, BaseEntity.GiveItemReason.Generic);
@@ -425,6 +512,29 @@ namespace Oxide.Plugins
             foreach (var zom in allZombies)
             {
                 zom.Kill();
+            }
+        }
+
+        public void OnSpawnZombie()
+        {
+            StartMapSpawning(Random.Range(2, ZombieRefreshAmount));
+        }
+
+        public void OnCheckZombieRadius(BasePlayer player)
+        {
+            var randomRadius = Random.Range(ZombieSpawnRadius, 500.0f);
+            var zombiesInRadius = GetEntitiesWithinRadius(player.transform.position, randomRadius, ZombiePrefabID);
+            if (zombiesInRadius.Count >= ZombieMaxPerRadius)
+            {
+                return;
+            }
+
+            var amountToSpawn = Math.Abs(ZombieMaxPerRadius - zombiesInRadius.Count);
+            Puts($"Spawning {amountToSpawn} zombies");
+
+            if (amountToSpawn > 0)
+            {
+                StartPlayerSpawning(player, amountToSpawn);
             }
         }
 
@@ -459,6 +569,9 @@ namespace Oxide.Plugins
                         item.AddItem(fragments, Random.Range(0, 5));
                     }
                 }
+
+                // Remove the corpse to avoid exploit
+                corpse.Kill();
                 return corpse;
             }
 
@@ -488,7 +601,7 @@ namespace Oxide.Plugins
         #region Commands
         private void SpawnZombieCommand(BasePlayer player, string command, string[] args)
         {
-            StartPlayerSpawning(player);
+            StartPlayerSpawning(player, MaxPerPlayer);
         }
 
         private void ClearZombiesCommand(BasePlayer player, string command, string[] args)
@@ -505,8 +618,15 @@ namespace Oxide.Plugins
         private void RegenerateZombiesCommand(BasePlayer player, string command, string[] args)
         {
             ClearAllZombies();
-            StartMapSpawning();
+            StartMapSpawning(ZombieInitalAmount);
             Player.Message(player, $"Current Zombie Population: {MsgFmt($"{TotalZombiesOnMap}", Red)}", Prefix, ShowIcon);
+        }
+
+        private void GetZombieRadiusCountCommand(BasePlayer player, string command, string[] args)
+        {
+            var radius = float.Parse(args[0]);
+            var radiusCount = GetEntitiesWithinRadius(player.transform.position, radius, ZombiePrefabID);
+            Player.Message(player, $"There are {MsgFmt($"{radiusCount.Count}", Red)} zombies with a {MsgFmt($"{radius}", Green)} radius of you", Prefix, ShowIcon);
         }
         #endregion
         #endregion
@@ -534,14 +654,26 @@ namespace Oxide.Plugins
         #endregion
 
         #region Helpers and Others
+        private List<BaseEntity> GetEntitiesWithinRadius(Vector3 position, float radius, uint prefabId)
+        {
+            List<BaseEntity> entities = new List<BaseEntity>();
+            Vis.Entities(position, radius, entities);
+
+            // Filter entities by prefabID
+            return entities.Where(entity => entity.prefabID == prefabId).ToList();
+        }
+
         private Vector3 GetRandomPositionAroundPlayer(BasePlayer player)
         {
             Vector3 playerPos = player.transform.position;
             Vector3 position = Vector3.zero;
 
+            var randomX = Random.Range(ZombieSpawnRadius, 500.0f);
+            var randomZ = Random.Range(ZombieSpawnRadius, 500.0f);
+
             for (int i = 0; i < 6; i++)
             {
-                position = new Vector3(Random.Range(playerPos.x - 20.0f, playerPos.x + 20.0f), 0, Random.Range(playerPos.z - 20.0f, playerPos.z + 20.0f));
+                position = new Vector3(Random.Range(playerPos.x - randomX, playerPos.x + randomX), 0, Random.Range(playerPos.z - randomZ, playerPos.z + randomZ));
                 position.y = TerrainMeta.HeightMap.GetHeight(position);
 
                 // If valid position
