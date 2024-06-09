@@ -22,6 +22,7 @@ using Oxide.Game.Rust.Libraries;
 using UnityEngine.UIElements;
 using Rust.AI;
 using Oxide.Ext;
+using Oxide.Core.Libraries;
 
 namespace Oxide.Plugins
 {
@@ -93,10 +94,11 @@ namespace Oxide.Plugins
 
         private object OnPlayerDeath(BasePlayer player, HitInfo info)
         {
-            if (player.isClient)
+            if (info.Initiator is ScarecrowNPC)
             {
-                Server.Broadcast(MsgFmt($"{player.displayName} died."), Prefix);
+                Server.Broadcast(MsgFmt($"{player.displayName} {_deathReasons[Random.Range(0, _deathReasons.Count)]}"), Prefix);
             }
+
             return null;
         }
 
@@ -106,6 +108,7 @@ namespace Oxide.Plugins
             {
                 Server.Broadcast(MsgFmt($"{player.displayName} is looting {target.displayName}'s corpse."), Prefix, ShowIcon);
             }
+
             return null;
         }
 
@@ -200,6 +203,11 @@ namespace Oxide.Plugins
         private const uint PlayerPrefabID = 4108440852;
         private const int GrenadeItemID = 1840822026;
         private readonly int SpawnLayerMask = LayerMask.GetMask("Default", "Tree", "Construction", "World", "Vehicle_Detailed", "Deployed");
+        private List<string> _zombieWeapons = new List<string>()
+        {
+            "knife.butcher"
+        };
+        
         private List<string> _zombieNames = new List<string>
         {
             "Rotten Rick",
@@ -254,6 +262,66 @@ namespace Oxide.Plugins
             "Phantom Phil"
         };
 
+        private List<string> _deathReasons = new List<string>()
+        {
+            "Tried to give a zombie a high five and became the appetizer",
+            "Was voted 'Most Delicious' by a group of zombies",
+            "Challenged a zombie to a dance-off and lost... and got eaten",
+            "Mistook a zombie for a friendly hugger",
+            "Asked a zombie for directions and got eaten instead of getting an answer",
+            "Tried to use a zombie as a piñata at a birthday party",
+            "Got too close to a zombie while trying to take a selfie",
+            "Played 'Ring Around the Rosie' with zombies and forgot the 'fall down' part",
+            "Was convinced that zombies were just misunderstood and got a zombie hug",
+            "Tried to teach zombies how to do the macarena and got eaten in the process",
+            "Thought zombies were just looking for a friend and volunteered to be one",
+            "Challenged a zombie to a staring contest and blinked first... and got eaten",
+            "Tried to outsmart zombies by playing dead... and ended up being dinner",
+            "Suggested a game of 'Duck, Duck, Goose' with zombies and regretted it",
+            "Invited zombies to a tea party and ended up being the main course",
+            "Attempted to lead a conga line with zombies and became the leader... of the buffet",
+            "Thought a zombie was just a really dedicated cosplayer and tried to take a photo",
+            "Offered a zombie a handshake and ended up armless",
+            "Asked a zombie for a bite of their sandwich and got more than they bargained for",
+            "Tried to make friends with zombies and ended up being their snack",
+            "Suggested a game of 'Red Rover' with zombies and got sent straight to the afterlife",
+            "Thought zombies were just trying to give a massage and ended up on the menu",
+            "Offered to be the zombie's tour guide and ended up as their tour snack",
+            "Mistook a zombie for a helpful hand and got a mouthful of fingers",
+            "Tried to give a zombie a makeover and ended up being the makeover",
+            "Tried to impress zombies with their dance moves and ended up being the main attraction",
+            "Thought zombies were just really dedicated fans of 'Thriller' and joined the dance",
+            "Asked a zombie for a bite of their burger and ended up as the burger",
+            "Challenged a zombie to a staring contest and lost... and got eaten",
+            "Thought zombies were just playing tag and became 'it' forever",
+            "Tried to tell jokes to zombies and became the punchline",
+            "Thought zombies were just looking for a game of 'Simon Says' and joined in",
+            "Tried to convince zombies to join a game of 'Hide and Seek' and got found",
+            "Thought zombies were just trying to give a hug and ended up as the hug",
+            "Offered zombies a piece of candy and ended up as their treat",
+            "Tried to show off their karaoke skills to zombies and got booed off stage... and eaten",
+            "Thought zombies were just looking for a hug and offered one",
+            "Mistook a zombie for a friendly neighbor and invited them in for tea... and brains",
+            "Tried to teach zombies how to do the cha-cha and got chomped instead",
+            "Thought zombies were just trying to play 'Tag' and joined the game",
+            "Asked a zombie for a bite of their sandwich and got more than they bargained for",
+            "Tried to impress zombies with their dance moves and ended up being the main attraction",
+            "Thought zombies were just really dedicated fans of 'Thriller' and joined the dance",
+            "Asked a zombie for a bite of their burger and ended up as the burger",
+            "Challenged a zombie to a staring contest and lost... and got eaten",
+            "Thought zombies were just playing tag and became 'it' forever",
+            "Tried to tell jokes to zombies and became the punchline",
+            "Thought zombies were just looking for a game of 'Simon Says' and joined in",
+            "Tried to convince zombies to join a game of 'Hide and Seek' and got found",
+            "Thought zombies were just trying to give a hug and ended up as the hug",
+            "Offered zombies a piece of candy and ended up as their treat",
+            "Tried to show off their karaoke skills to zombies and got booed off stage... and eaten",
+            "Thought zombies were just looking for a hug and offered one",
+            "Mistook a zombie for a friendly neighbor and invited them in for tea... and brains",
+            "Tried to teach zombies how to do the cha-cha and got chomped instead",
+            "Thought zombies were just trying to play 'Tag' and joined the game",
+        };
+
         // Zombie radius options
         private const float MinPlayerSpawnDistance = 60.0f;
         private const float MaxPlayerSpawnDistance = 150.0f;
@@ -261,10 +329,11 @@ namespace Oxide.Plugins
         // Spawn limits
         private const int MaxZombies = 5000;
         private const int MaxPerPlayer = 1;
-        private int MaxPerInitMap = 500;
+        private int MaxPerInitMap = 50;
 
         // Zombie properties
         private const float ZombieHealth = 20.0f;
+        private int ZombieScrapCap = 50;
 
         // Globals
         private int _totalKilledZombies;
@@ -308,58 +377,46 @@ namespace Oxide.Plugins
 
         public void SpawnZombie(Vector3 pos)
         {
-            try
+            if (TotalZombiesOnMap >= MaxZombies)
             {
-                if (TotalZombiesOnMap >= MaxZombies)
-                {
-                    Puts("Zombie count reached");
-                    return;
-                }
-
-                ScarecrowNPC zombie = GameManager.server.CreateEntity(ZombiePrefab, pos) as ScarecrowNPC;
-                if (zombie == null)
-                {
-                    return;
-                }
-
-                zombie.Spawn();
-                zombie.displayName = _zombieNames[Random.Range(0, _zombieNames.Count)];
-
-                if (zombie.TryGetComponent(out BaseNavigator navigator))
-                {
-                    navigator.ForceToGround();
-                    navigator.PlaceOnNavMesh(0);
-                }
-
-                // Set health
-                zombie.SetMaxHealth(ZombieHealth);
-                zombie.SetHealth(ZombieHealth);
-
-                //Item.knife.butcherx1.694604
-
-                ItemContainer inventory = zombie.inventory.containerBelt as ItemContainer;
-                inventory.Clear();
-
-                // TODO:
-                // Add the knife
-                //var knife = ItemManager.CreateByItemID(694604);
-                //if (knife != null)
-                //{
-                //    inventory.itemList.Add(knife);
-                //}
-
-                //foreach (var item in inventory.itemList)
-                //{
-                //    Puts($"Inventory: {item}");
-                //}
-
-                Puts($"({TotalZombiesOnMap}) Zombie {zombie.displayName} at x={pos.x}, y={pos.y}, z={pos.z}");
+                Puts("Zombie count reached");
+                return;
             }
-            catch (Exception ex)
+
+            ScarecrowNPC zombie = GameManager.server.CreateEntity(ZombiePrefab, pos) as ScarecrowNPC;
+            if (zombie == null)
             {
-                Puts($"Exception when attempting SpawnZombie: {ex}");
-                //throw;
+                return;
             }
+
+            zombie.Spawn();
+            zombie.displayName = _zombieNames[Random.Range(0, _zombieNames.Count)];
+
+            if (zombie.TryGetComponent(out BaseNavigator navigator))
+            {
+                navigator.ForceToGround();
+                navigator.PlaceOnNavMesh(0);
+            }
+
+            // Set health
+            zombie.SetMaxHealth(ZombieHealth);
+            zombie.SetHealth(ZombieHealth);
+
+            // Clear inventory
+            ItemContainer inventory = zombie.inventory.containerBelt as ItemContainer;
+            inventory.itemList.Clear();
+
+            // Add weapon
+            var itemDef = ItemManager.FindItemDefinition("knife.butcher");
+            if (itemDef != null)
+            {
+                //inventory.itemList.Add(knife);
+                var zomObj = zombie as BaseCombatEntity;
+                Item weaponItem = ItemManager.CreateByItemID(itemDef.itemid, 1, 0);
+                zomObj.GiveItem(weaponItem, BaseEntity.GiveItemReason.Generic);
+            }
+
+            Puts($"({TotalZombiesOnMap}) Zombie {zombie.displayName} at x={pos.x}, y={pos.y}, z={pos.z}");
         }
 
         public void ClearAllZombies()
@@ -369,6 +426,43 @@ namespace Oxide.Plugins
             {
                 zom.Kill();
             }
+        }
+
+        BaseCorpse OnCorpsePopulate(BasePlayer npcPlayer, NPCPlayerCorpse corpse)
+        {
+            if (npcPlayer is ScarecrowNPC)
+            {
+                foreach (var item in corpse.containers)
+                {
+                    // Scrap
+                    var scrap = ItemManager.FindItemDefinition("scrap");
+                    if (scrap != null)
+                    {
+                        item.AddItem(scrap, Random.Range(0, ZombieScrapCap));
+                    }
+
+                    // Low chance of blood
+                    var chance = Random.Range(0, 10);
+                    if (chance == 5)
+                    {
+                        var blood = ItemManager.FindItemDefinition("blood");
+                        if (blood != null)
+                        {
+                            item.AddItem(blood, 1);
+                        }
+                    }
+
+                    // Fragments
+                    var fragments = ItemManager.FindItemDefinition("bone.fragments");
+                    if (fragments != null)
+                    {
+                        item.AddItem(fragments, Random.Range(0, 5));
+                    }
+                }
+                return corpse;
+            }
+
+            return null;
         }
 
         private void OnEntityDeath(BaseCombatEntity entity, HitInfo info)
