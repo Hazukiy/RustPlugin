@@ -37,8 +37,9 @@ namespace Oxide.Plugins
         private const string Blue = "#32a4f5";
         private const string Green = "#1cbf68";
         private const string Red = "#DE0F17";
+        private const string Orange = "#ED7A00";
         private const string Prefix = "[ZM]";
-        private string ChatPrefix = $"<color={Red}>{Prefix}</color> ";
+        private string ChatPrefix = $"<color={Red}>{Prefix}</color><color={Orange}>";
 
         // The delay between general messages
         private const int ReportTimeDelay = 300; // 600 = 10 minutes 
@@ -50,16 +51,44 @@ namespace Oxide.Plugins
         private Timer _voteDayTimeout;
         private Timer _voteDayCooldown;
 
+        // Cache
+        private List<PlayerStats> _connectedPlayers;
+
         private void Init()
         {
             _voteDayPlayers = new List<BasePlayer>();
+            _connectedPlayers = new List<PlayerStats>();
 
             // Register general commands
             cmd.AddChatCommand("time", this, nameof(TimeCommand));
             cmd.AddChatCommand("voteday", this, nameof(VoteDayCommand));
+        }
 
-            // Register Zombie commands
-            InitZombieCommands();
+        private void Unload()
+        {
+            foreach (var player in BasePlayer.activePlayerList)
+            {
+                DestroyPlayerUI(player);
+            }
+        }
+
+        public void BuildPlayer(BasePlayer player)
+        {
+            var playerData = _connectedPlayers.FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID);
+            if (playerData == null)
+            {
+                var stats = new PlayerStats()
+                {
+                    Owner = player
+                };
+                stats.BaseStats.JoinedTime = DateTime.Now;
+                _connectedPlayers.Add(stats);
+
+                SendConsoleMessage($"Setting new stats profile for player {player.displayName}");
+            }
+
+            // Generate UI
+            RegenerateUI(player);
         }
 
         #region General Hooks & Events
@@ -71,24 +100,37 @@ namespace Oxide.Plugins
                 SendServerAnnouncement($"Server time is now: {Format($"{TOD_Sky.Instance.Cycle.DateTime:hh:mm} {TOD_Sky.Instance.Cycle.DateTime:tt}", Red)}");
             });
 
-            // Start zombie spawn timer
-            timer.Every(ZombieSpawnTime, () => OnSpawnZombie());
-
             // Get zombies
             var zombieCount = GetEntitiesByPrefabId(ZombiePrefabID).Count;
             SendServerAnnouncement($"ZombieMod {Format($"v{Version}", Green)} successfully loaded.");
             SendConsoleMessage($"ZombieMod v{Version} successfully loaded.");
+
+            // Rebuild each player
+            foreach (var player in BasePlayer.activePlayerList)
+            {
+                BuildPlayer(player);
+            }
+
+            // Initialise zombies
+            InitZombies();
         }
 
         private void OnPlayerConnected(BasePlayer player)
         {
             SendPlayerMessage(player, "Commands: (/time, /voteday)");
             SendServerAnnouncement($"{Format($"{player.displayName}", Green)} has connected.");
+
+            BuildPlayer(player);
         }
 
         private void OnPlayerDisconnected(BasePlayer player)
         {
             SendServerAnnouncement($"{Format($"{player.displayName}", Red)} has disconnected.");
+
+            // Remove from cache
+            _connectedPlayers.Remove(_connectedPlayers.FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID));
+
+            SendConsoleMessage($"Cleaned up player {player.displayName} after disconnect.");
         }
 
         private object OnPlayerDeath(BasePlayer player, HitInfo info)
@@ -96,6 +138,7 @@ namespace Oxide.Plugins
             if (info.Initiator is ScarecrowNPC)
             {
                 SendServerAnnouncement($"{Format($"{player.displayName}", Red)} {_deathReasons[Random.Range(0, _deathReasons.Count)]}");
+                IncreasePlayerDeaths(player);
             }
             return null;
         }
@@ -113,6 +156,8 @@ namespace Oxide.Plugins
         {
             if (player.IsConnected)
             {
+                BuildPlayer(player);
+
                 var zombiesInRadius = GetEntitiesWithinRadius(player.transform.position, PlayerScanRadius, ZombiePrefabID);
                 if (zombiesInRadius.Count >= MaxZombiesInRadius)
                 {
@@ -366,6 +411,7 @@ namespace Oxide.Plugins
         };
 
         private int _totalZombiesKilled;
+        private Timer _zombieSpawnTimer;
 
         #region Zombie Properties
         // Zombie Spawn limits
@@ -387,6 +433,29 @@ namespace Oxide.Plugins
         private const float MaxEasyZombieHealth = 40.0f;
         private int MaxScrapLoot = 5;
         #endregion
+
+        public void InitZombies()
+        {
+            // Chat commands
+            cmd.AddChatCommand("zspawn", this, nameof(SpawnZombieCommand));
+            cmd.AddChatCommand("zclear", this, nameof(ClearZombiesCommand));
+            cmd.AddChatCommand("zpop", this, nameof(GetZombieCountCommand));
+            cmd.AddChatCommand("zre", this, nameof(RegenerateZombiesCommand));
+            cmd.AddChatCommand("zradius", this, nameof(GetZombieRadiusCountCommand));
+
+            // Get current count and spawn some initial zombies
+            var mapCount = GetEntitiesByPrefabId(ZombiePrefabID).Count;
+            if (mapCount <= (MaxZombies/2))
+            {
+                StartMapSpawning(MaxPerRegen);
+            }
+
+            // Now kick off a timer for spawning many zombies
+            _zombieSpawnTimer = timer.Every(ZombieSpawnTime, () =>
+            {
+                StartMapSpawning(Random.Range(MinPerRegen, MaxPerRegen));
+            });
+        }
 
         #region Spawning
         private void StartMapSpawning(int amount)
@@ -491,11 +560,6 @@ namespace Oxide.Plugins
         #endregion
 
         #region Hooks and Events
-        public void OnSpawnZombie()
-        {
-            StartMapSpawning(Random.Range(MinPerRegen, MaxPerRegen));
-        }
-
         public void OnCheckZombieRadius(BasePlayer player)
         {
             var randomRadius = Random.Range(MinSpawnRadius, MaxSpawnRadius);
@@ -570,6 +634,7 @@ namespace Oxide.Plugins
                     }
 
                     _totalZombiesKilled++;
+                    IncreaseZombieKills(player);
 
                     var zombiesOnMap = GetEntitiesByPrefabId(ZombiePrefabID).Count;
                     SendServerAnnouncement($"{Format(player.displayName, Green)} killed zombie {Format(target.displayName, Red)}. {Format(_totalZombiesKilled, Red)} zombies have been killed, there are {zombiesOnMap} left.");
@@ -579,15 +644,6 @@ namespace Oxide.Plugins
         #endregion
 
         #region Commands
-        public void InitZombieCommands()
-        {
-            cmd.AddChatCommand("zspawn", this, nameof(SpawnZombieCommand));
-            cmd.AddChatCommand("zclear", this, nameof(ClearZombiesCommand));
-            cmd.AddChatCommand("zpop", this, nameof(GetZombieCountCommand));
-            cmd.AddChatCommand("zre", this, nameof(RegenerateZombiesCommand));
-            cmd.AddChatCommand("zradius", this, nameof(GetZombieRadiusCountCommand));
-        }
-
         private void SpawnZombieCommand(BasePlayer player, string command, string[] args)
         {
             if (!player.IsAdmin)
@@ -679,26 +735,91 @@ namespace Oxide.Plugins
         #endregion
         #endregion
 
-        #region Feature:HUD(todo)
-        private const string PanelName = "ZombieKillsUIPanel";
-
-        private void RenderUI(BasePlayer player)
+        #region Feature:Stats
+        public void IncreaseZombieKills(BasePlayer player)
         {
-            var elements = new CuiElementContainer();
-            var panel = elements.Add(new CuiPanel
-            {
-                Image = { Color = "0.1 0.1 0.1 0.7" }, // Background color (RGBA)
-                RectTransform = { AnchorMin = "0.4 0.9", AnchorMax = "0.6 1.0" } // Position and size
-            }, "Overlay", "ZombieKillsUIPanel");
+            _connectedPlayers
+                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
+                .ZombieStats
+                .ZombieKills++;
 
-            elements.Add(new CuiLabel
-            {
-                Text = { Text = $"Zombie Kills: {_totalZombiesKilled}", FontSize = 18, Align = TextAnchor.MiddleCenter },
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" }
-            }, panel);
-
-            CuiHelper.AddUi(player, elements);
+            RegenerateUI(player);
         }
+
+        public void IncreasePlayerDeaths(BasePlayer player)
+        {
+            _connectedPlayers
+                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
+                .ZombieStats
+                .DeathByZombie++;
+
+            RegenerateUI(player);
+        }
+
+        public int GetZombieKills(BasePlayer player ) => _connectedPlayers
+                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
+                .ZombieStats
+                .ZombieKills;
+
+        public int GetDeathByZombie(BasePlayer player) => _connectedPlayers
+                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
+                .ZombieStats
+                .DeathByZombie;
+        #endregion
+
+        #region Feature:HUD
+        private Dictionary<ulong, string> _playerUIs = new Dictionary<ulong, string>();
+        private float HudTick = 1.0f;
+
+        private void RegenerateUI(BasePlayer player)
+        {
+            if (player == null) return;
+
+            // Destory previous UI
+            DestroyPlayerUI(player);
+
+            var container = new CuiElementContainer();
+            var panel = new CuiPanel
+            {
+                Image = { Color = "0.1 0.1 0.1 0.4" },
+                RectTransform = { AnchorMin = "0.01 0.9", AnchorMax = "0.1 0.99" },
+                CursorEnabled = false
+            };
+            var panelName = $"{player.OwnerID}-zhud";
+            container.Add(panel, "Hud", panelName);
+
+            var playerStats = GetZombieStats(player);
+
+            var hudTitle = new CuiLabel
+            {
+                Text = { Text = $"ZM v{Version}", FontSize = 16, Align = TextAnchor.UpperLeft, Color = "0.859 0.039 0.039 1" },
+                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "1 1" }
+            };
+            container.Add(hudTitle, panelName);
+
+            var text = new CuiLabel
+            {
+                Text = { Text = $"\nGlobal Zombie Kills: {_totalZombiesKilled}\n{playerStats}", FontSize = 12, Align = TextAnchor.MiddleLeft, Color = "0.647 0.067 0.067 1" },
+                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "1 1" }
+            };
+            container.Add(text, panelName);
+
+            CuiHelper.AddUi(player, container);
+            _playerUIs[player.OwnerID] = panelName;
+        }
+
+        private void DestroyPlayerUI(BasePlayer player)
+        {
+            if (_playerUIs.TryGetValue(player.OwnerID, out string panelName))
+            {
+                CuiHelper.DestroyUi(player, panelName);
+            }
+        }
+
+        private string GetZombieStats(BasePlayer player) =>
+            _connectedPlayers
+            .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
+            .ZombieStats.ToString();
         #endregion
 
         #region Helpers and Others
@@ -785,6 +906,34 @@ namespace Oxide.Plugins
         private void SendConsoleMessage(string msg) => Puts($"{Prefix} {msg}");
 
         private string Format(object msg, string colour) => $"<color={colour}>{msg}</color>";
+        #endregion
+
+        #region Models
+        internal class PlayerStats
+        {
+            public BasePlayer Owner { get; set; }
+
+            public BaseStats BaseStats { get; set; } = new BaseStats();
+
+            public PlayerZombieStats ZombieStats { get; set; } = new PlayerZombieStats();
+        }
+
+        internal class BaseStats
+        {
+            public DateTime JoinedTime { get; set; }
+        }
+
+        internal class PlayerZombieStats
+        {
+            public int ZombieKills { get; set; }
+
+            public int DeathByZombie { get; set; }
+
+            public override string ToString()
+            {
+                return $"Zombie Kills: {ZombieKills}\nDeaths by Zombie: {DeathByZombie}";
+            }
+        }
         #endregion
     }
 }
