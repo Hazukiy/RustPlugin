@@ -25,6 +25,8 @@ using Oxide.Ext;
 using Oxide.Core.Libraries;
 using CompanionServer.Handlers;
 using static ConsoleSystem;
+using Steamworks.ServerList;
+using System.Text;
 
 namespace Oxide.Plugins
 {
@@ -34,15 +36,19 @@ namespace Oxide.Plugins
     {
         #region Core
         private const string Version = "1.0.1";
-        private const string Blue = "#32a4f5";
+        private const string Blue = "#011575";
         private const string Green = "#1cbf68";
-        private const string Red = "#DE0F17";
+
+        private const string PrimaryRed = "#DF3434";
+        private const string SecondaryRed = "#BD2323";
+
         private const string Orange = "#ED7A00";
+        private const string Yellow = "#DFEC08";
         private const string Prefix = "[ZM]";
-        private string ChatPrefix = $"<color={Red}>{Prefix}</color><color={Orange}>";
+        private string ChatPrefix = $"<color={SecondaryRed}>{Prefix}</color>";
 
         // The delay between general messages
-        private const int ReportTimeDelay = 300; // 600 = 10 minutes 
+        private const int ReportTimeDelay = 700;
 
         // Voteday related
         private bool _isVoteDayActive;
@@ -52,16 +58,24 @@ namespace Oxide.Plugins
         private Timer _voteDayCooldown;
 
         // Cache
+        private Dictionary<ulong, bool> godModePlayers;
         private List<PlayerStats> _connectedPlayers;
+        private Hash<ulong, bool> noclipPlayers;
 
         private void Init()
         {
-            _voteDayPlayers = new List<BasePlayer>();
+            godModePlayers = new Dictionary<ulong, bool>();
+            noclipPlayers = new Hash<ulong, bool>();
             _connectedPlayers = new List<PlayerStats>();
+            _voteDayPlayers = new List<BasePlayer>();
 
             // Register general commands
             cmd.AddChatCommand("time", this, nameof(TimeCommand));
             cmd.AddChatCommand("voteday", this, nameof(VoteDayCommand));
+
+            // Admin
+            cmd.AddChatCommand("godmode", this, nameof(ToggleGodModeCommand));
+            cmd.AddChatCommand("heal", this, nameof(HealCommand));
         }
 
         private void Unload()
@@ -70,11 +84,22 @@ namespace Oxide.Plugins
             {
                 DestroyPlayerUI(player);
             }
+
+            _playerUIs.Clear();
+            _connectedPlayers.Clear();
+            _voteDayPlayers.Clear();
+            godModePlayers.Clear();
+
+            _voteDayTimeout = null;
+            _voteDayCooldown = null;
+            _connectedPlayers = null;
+            _zombieSpawnTimer = null;
+            godModePlayers = null;
         }
 
         public void BuildPlayer(BasePlayer player)
         {
-            var playerData = _connectedPlayers.FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID);
+            var playerData = _connectedPlayers.FirstOrDefault(p => p.Owner == player);
             if (playerData == null)
             {
                 var stats = new PlayerStats()
@@ -83,12 +108,34 @@ namespace Oxide.Plugins
                 };
                 stats.BaseStats.JoinedTime = DateTime.Now;
                 _connectedPlayers.Add(stats);
-
-                SendConsoleMessage($"Setting new stats profile for player {player.displayName}");
             }
 
             // Generate UI
             RegenerateUI(player);
+
+            // Start zombie scan timer
+            if (!_playerScanTimer.TryGetValue(player, out Timer scanTimer))
+            {
+                scanTimer = timer.Every(ScanTimerInterval, () => OnCheckZombieRadius(player));
+
+                // Add
+                _playerScanTimer.Add(player, scanTimer);
+            }
+        }
+
+        private void DestroyPlayer(BasePlayer player)
+        {
+            // Remove stats
+            _connectedPlayers.Remove(_connectedPlayers.FirstOrDefault(p => p.Owner == player));
+
+            // Remove zombie spawn timer
+            if (_playerScanTimer.TryGetValue(player, out Timer playerTimer))
+            {
+                playerTimer.Destroy();
+                _playerScanTimer.Remove(player);
+            }
+
+            SendConsoleMessage($"Cleaned up player {player.displayName} after disconnect.");
         }
 
         #region General Hooks & Events
@@ -97,22 +144,22 @@ namespace Oxide.Plugins
             // Start timer for broadcasting server time
             timer.Every(ReportTimeDelay, () =>
             {
-                SendServerAnnouncement($"Server time is now: {Format($"{TOD_Sky.Instance.Cycle.DateTime:hh:mm} {TOD_Sky.Instance.Cycle.DateTime:tt}", Red)}");
+                SendServerAnnouncement($"Server time is now: {Format($"{TOD_Sky.Instance.Cycle.DateTime:hh:mm} {TOD_Sky.Instance.Cycle.DateTime:tt}", PrimaryRed)}");
             });
 
             // Get zombies
             var zombieCount = GetEntitiesByPrefabId(ZombiePrefabID).Count;
-            SendServerAnnouncement($"ZombieMod {Format($"v{Version}", Green)} successfully loaded.");
+            SendServerAnnouncement($"ZombieMod {Format($"v{Version}", Green)} successfully loaded. {zombieCount} zombies currently on map.");
             SendConsoleMessage($"ZombieMod v{Version} successfully loaded.");
+
+            // Initialise zombies
+            InitZombies();
 
             // Rebuild each player
             foreach (var player in BasePlayer.activePlayerList)
             {
                 BuildPlayer(player);
             }
-
-            // Initialise zombies
-            InitZombies();
         }
 
         private void OnPlayerConnected(BasePlayer player)
@@ -121,24 +168,46 @@ namespace Oxide.Plugins
             SendServerAnnouncement($"{Format($"{player.displayName}", Green)} has connected.");
 
             BuildPlayer(player);
+
+            // Regenerate UI
+            // Rebuild each player
+            ReloadAllPlayerUI();
         }
 
         private void OnPlayerDisconnected(BasePlayer player)
         {
-            SendServerAnnouncement($"{Format($"{player.displayName}", Red)} has disconnected.");
+            SendServerAnnouncement($"{Format($"{player.displayName}", PrimaryRed)} has disconnected.");
 
-            // Remove from cache
-            _connectedPlayers.Remove(_connectedPlayers.FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID));
+            DestroyPlayer(player);
 
-            SendConsoleMessage($"Cleaned up player {player.displayName} after disconnect.");
+            // Regenerate UI
+            // Rebuild each player
+            ReloadAllPlayerUI();
+        }
+
+        private void ReloadAllPlayerUI()
+        {
+            // Get online players only
+            var online = BasePlayer.activePlayerList.Where(p => p.IsConnected);
+            if (online != null)
+            {
+                foreach (var player in online)
+                {
+                    RegenerateUI(player);
+                }
+            }
         }
 
         private object OnPlayerDeath(BasePlayer player, HitInfo info)
         {
-            if (info.Initiator is ScarecrowNPC)
+            if (info?.Initiator != null && info?.Initiator is ScarecrowNPC)
             {
-                SendServerAnnouncement($"{Format($"{player.displayName}", Red)} {_deathReasons[Random.Range(0, _deathReasons.Count)]}");
-                IncreasePlayerDeaths(player);
+                SendServerAnnouncement($"{Format(player.displayName, PrimaryRed)} {_deathReasons[Random.Range(0, _deathReasons.Count)]}");
+
+                if (player.IsConnected)
+                {
+                    IncreasePlayerDeaths(player);
+                }
             }
             return null;
         }
@@ -147,7 +216,7 @@ namespace Oxide.Plugins
         {
             if (player.IsConnected)
             {
-                SendServerAnnouncement($"{Format($"{player.displayName}", Red)} is looting {Format($"{target.displayName}", Green)}'s corpse.");
+                SendServerAnnouncement($"{Format($"{player.displayName}", PrimaryRed)} is looting {Format($"{target.displayName}", Green)}'s corpse.");
             }
             return null;
         }
@@ -158,24 +227,82 @@ namespace Oxide.Plugins
             {
                 BuildPlayer(player);
 
-                var zombiesInRadius = GetEntitiesWithinRadius(player.transform.position, PlayerScanRadius, ZombiePrefabID);
-                if (zombiesInRadius.Count >= MaxZombiesInRadius)
+                // Initial zombies 
+                OnCheckZombieRadius(player);
+            }
+        }
+
+        private void OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
+        {
+            BasePlayer player = entity as BasePlayer;
+
+            // Check godmode
+            if (player != null && player.IsConnected)
+            {
+                if (godModePlayers.ContainsKey(player.userID) && godModePlayers[player.userID])
                 {
-                    return;
+                    info.damageTypes = new DamageTypeList();
+                    info.HitMaterial = 0;
+                    info.PointStart = Vector3.zero;
+                    info.PointEnd = Vector3.zero;
                 }
-
-                var amountToSpawn = MaxZombiesInRadius - zombiesInRadius.Count;
-                SendConsoleMessage($"Player {player.displayName} respawned, spawning {amountToSpawn} zombies");
-
-                if (amountToSpawn > 0)
+                else
                 {
-                    StartPlayerSpawning(player, amountToSpawn);
+                    if (info.Initiator is ScarecrowNPC)
+                    {
+                        // Apply the damage multiplier
+                        info.damageTypes.ScaleAll(DamageMultiplier);
+                    }
                 }
             }
         }
         #endregion
 
         #region General Commands
+        private void ToggleGodModeCommand(BasePlayer player, string command, string[] args)
+        {
+            if (player == null) return;
+
+            if (!player.IsAdmin)
+            {
+                SendPlayerMessage(player, "Nope :/");
+                return;
+            }
+
+            if (godModePlayers.ContainsKey(player.userID))
+            {
+                godModePlayers[player.userID] = !godModePlayers[player.userID];
+            }
+            else
+            {
+                godModePlayers[player.userID] = true;
+            }
+
+            if (godModePlayers[player.userID])
+            {
+                player.ChatMessage("God mode enabled.");
+            }
+            else
+            {
+                player.ChatMessage("God mode disabled.");
+            }
+        }
+
+        private void HealCommand(BasePlayer player, string command, string[] args)
+        {
+            if (player == null) return;
+
+            if (!player.IsAdmin)
+            {
+                SendPlayerMessage(player, "Nope :/");
+                return;
+            }
+
+            player.health = player.MaxHealth();
+
+            SendPlayerMessage(player, $"{Format("Healed to full", Green)}");
+        }
+
         private void TimeCommand(BasePlayer player, string command, string[] args)
         {
             SendPlayerMessage(player, $"Server time is now: {Format($"{TOD_Sky.Instance.Cycle.DateTime:hh:mm} {TOD_Sky.Instance.Cycle.DateTime:tt}", Green)}");
@@ -212,7 +339,7 @@ namespace Oxide.Plugins
             {
                 _voteDayTimeout = timer.Once(60f, () =>
                 {
-                    SendServerAnnouncement($"Voteday timed out, only got {Format("{_totalVoteDayCount} / {needed}", Red)} votes.");
+                    SendServerAnnouncement($"Voteday timed out, only got {Format($"{_totalVoteDayCount} / {needed}", PrimaryRed)} votes.");
                     _totalVoteDayCount = 0;
                     _isVoteDayActive = false;
                     _voteDayPlayers.Clear();
@@ -222,7 +349,7 @@ namespace Oxide.Plugins
             // Set that there's an active vote 
             _isVoteDayActive = true;
 
-            SendServerAnnouncement($"Player {Format(player.displayName, Green)} has voted to change time to day. {Format($"({_totalVoteDayCount} / {needed} votes needed)", Red)}");
+            SendServerAnnouncement($"Player {Format(player.displayName, Green)} has voted to change time to day. {Format($"({_totalVoteDayCount} / {needed} votes needed)", PrimaryRed)}");
 
             // Check to see if vote needed has been met yet
             if (_totalVoteDayCount >= needed)
@@ -254,8 +381,9 @@ namespace Oxide.Plugins
         #endregion
         #endregion
 
-        #region Feature:Zombie Spawning
+        #region Feature:Zombies
         private const string ZombiePrefab = "assets/prefabs/npc/scarecrow/scarecrow.prefab";
+        private const string ZombieCorpsePrefab = "assets/prefabs/npc/murderer/murderer_corpse.prefab";
         private const bool EnableZombies = true; // False turns zombie spawning off
         private const uint ZombiePrefabID = 3473349223;
 
@@ -263,7 +391,9 @@ namespace Oxide.Plugins
         private readonly int SpawnLayerMask = LayerMask.GetMask("Default", "Tree", "Construction", "World", "Vehicle_Detailed", "Deployed");
         private readonly List<string> _zombieWeapons = new List<string>()
         {
-            "knife.butcher"
+            "knife.butcher",
+            "knife.bone",
+            "knife.combat"
         };  
         private readonly List<string> _zombieNames = new List<string>
         {
@@ -402,40 +532,73 @@ namespace Oxide.Plugins
         };
         private readonly List<string> _scarySpawnMessages = new List<string>()
         {
-            "You hear rustling in some bushes near by",
-            "Something is watching you...",
-            "A shadow moves in the corner of your eye...",
-            "You feel an eerie chill down your spine.",
-            "Whispers echo in the darkness around you.",
-            "You sense an unseen presence nearby..."
+            "You hear rustling in some bushes nearby.",
+            "Something is watching you from the shadows...",
+            "A shadowy figure moves in the corner of your eye...",
+            "You feel an eerie chill run down your spine.",
+            "Whispers echo softly in the darkness around you.",
+            "You sense an unseen presence lingering nearby...",
+            "The air grows heavy with an unsettling silence.",
+            "The hairs on the back of your neck stand on end.",
+            "A cold shiver crawls up your back unexpectedly.",
+            "The night seems darker, enveloping you in its embrace.",
+            "An ominous feeling settles over the area."
+        };
+        private readonly List<ZombieLootTableItem> _zombieLootTable = new List<ZombieLootTableItem>()
+        {
+            new ZombieLootTableItem() { Index = 0, Name = "scrap", MinAmount = 5, MaxAmount = 10 },
+            new ZombieLootTableItem() { Index = 1, Name = "bone.fragments", MinAmount = 5, MaxAmount = 10 },
+        };
+        private static Dictionary<string, string> _zombiePlayerTitles = new Dictionary<string, string>()
+        {
+            { "0-9", "Zombie Bait" },
+            { "10-19", "Novice Survivor" },
+            { "20-29", "Grizzled Fighter" },
+            { "30-39", "Undead Slayer" },
+            { "40-49", "Zombie Hunter" },
+            { "50-59", "Apocalypse Survivor" },
+            { "60-69", "Zombie Annihilator" },
+            { "70-79", "Ultimate Undead Slayer" },
+            { "80-89", "Zombie Exterminator" },
+            { "90-99", "Legendary Apocalypse Survivor" },
+            { "100+", "Master of the Undead" }
         };
 
-        private int _totalZombiesKilled;
+        private const float DamageMultiplier = 0.3f; // How much damage a zombie does to the player
         private Timer _zombieSpawnTimer;
+        private Dictionary<BasePlayer, Timer> _playerScanTimer;
 
         #region Zombie Properties
-        // Zombie Spawn limits
+        // Zombie Map Spawn limits
         private const int MaxZombies = 1500;
         private const int MinPerRegen = 5; // Min amount of zombies to respawn around map
         private const int MaxPerRegen = 20; // How many zombies can be spawned on the map at a single time
-        private const float ZombieSpawnTime = 120.0f; // How often to spawn zombies on the map 
+        private float ZombieSpawnTime = (float)TimeSpan.FromMinutes(15).TotalSeconds; // How often to spawn zombies on the map 
 
-        // Zombie Radius
+        // Base Zombie Radius
         private const float MinSpawnRadius = 100.0f;
-        private float MaxSpawnRadius = 300.0f;
-        private float PlayerScanRadius = 100.0f; // Radius for checking zombie count from player 
-        private int MaxZombiesInRadius = 5;
+        private const float MaxSpawnRadius = 300.0f;
 
         // Zombie properties
         private const float MinZombieHealth = 50.0f;
-        private const float MaxZombieHealth = 150.0f;
+        private const float MaxZombieHealth = 130.0f;
         private const float MinEasyZombieHealth = 20.0f;
         private const float MaxEasyZombieHealth = 40.0f;
-        private int MaxScrapLoot = 5;
+        private const int MaxScrapLoot = 5;
+
+        // Zombie scan
+        private float ScanTimerInterval = (float)TimeSpan.FromMinutes(10).TotalSeconds;
+        private const float MinScanSpawnRadius = 60.0f;
+        private const float MaxScanSpawnRadius = 100.0f;
+        private const int MinScanSpawnAmount = 2;
+        private const int MaxScanSpawnAmount = 10;
+        private const int MaxScanInRadius = 10;
         #endregion
 
         public void InitZombies()
         {
+            _playerScanTimer = new Dictionary<BasePlayer, Timer>();
+
             // Chat commands
             cmd.AddChatCommand("zspawn", this, nameof(SpawnZombieCommand));
             cmd.AddChatCommand("zclear", this, nameof(ClearZombiesCommand));
@@ -486,7 +649,7 @@ namespace Oxide.Plugins
             SendServerAnnouncement(phrase);
         }
 
-        public void StartPlayerSpawning(BasePlayer player, int amount)
+        public void StartPlayerSpawning(BasePlayer player, int amount, float minRadius, float maxRadius)
         {
             if (!EnableZombies) return;
 
@@ -501,7 +664,7 @@ namespace Oxide.Plugins
             // Spawn
             for (var i = 0; i < amount; i++)
             {
-                Vector3 pos = GetRandomPositionAroundPlayer(player, MinSpawnRadius, MaxSpawnRadius);
+                Vector3 pos = GetRandomPositionAroundPlayer(player, minRadius, maxRadius);
                 var health = Random.Range(MinEasyZombieHealth, MaxEasyZombieHealth);
 
                 SpawnZombie(pos, health);
@@ -519,6 +682,8 @@ namespace Oxide.Plugins
             {
                 return;
             }
+
+            var zombieEnt = zombie as BaseCombatEntity;
 
             zombie.Spawn();
             zombie.displayName = _zombieNames[Random.Range(0, _zombieNames.Count)];
@@ -538,15 +703,16 @@ namespace Oxide.Plugins
             inventory.itemList.Clear();
 
             // Add weapon
-            var itemDef = ItemManager.FindItemDefinition("knife.butcher");
+            var itemDef = ItemManager.FindItemDefinition("knife.bone");
             if (itemDef != null)
             {
+                Item weaponItem = ItemManager.CreateByItemID(itemDef.itemid, 1, 1277364396);
+
                 var zomObj = zombie as BaseCombatEntity;
-                Item weaponItem = ItemManager.CreateByItemID(itemDef.itemid, 1, 0);
                 zomObj.GiveItem(weaponItem, BaseEntity.GiveItemReason.Generic);
             }
 
-            SendConsoleMessage($"(SpawnZombie) Zombie ({zombie.displayName}) spawned at x={pos.x}, y={pos.y}, z={pos.z}");
+            //SendConsoleMessage($"(SpawnZombie) Zombie ({zombie.displayName}) spawned at x={pos.x}, y={pos.y}, z={pos.z}");
         }
 
         public void ClearAllZombies()
@@ -562,57 +728,53 @@ namespace Oxide.Plugins
         #region Hooks and Events
         public void OnCheckZombieRadius(BasePlayer player)
         {
-            var randomRadius = Random.Range(MinSpawnRadius, MaxSpawnRadius);
-            var zombiesInRadius = GetEntitiesWithinRadius(player.transform.position, randomRadius, ZombiePrefabID);
-            if (zombiesInRadius.Count >= MaxZombiesInRadius)
+            if (!player.IsAlive()) return;
+
+            // Check amount within radius
+            var amountInRadius = GetEntitiesWithinRadius(player.transform.position, MinScanSpawnRadius, ZombiePrefabID);
+            SendConsoleMessage($"(OnCheckZombieRadius) Zombie count near player: {amountInRadius?.Count}");
+
+            if (amountInRadius?.Count >= MaxScanInRadius)
             {
+                SendConsoleMessage("(OnCheckZombieRadius) Skipping spawning of zombies near player as threshold has been met.");
                 return;
             }
 
-            var amountToSpawn = Math.Abs(MaxZombiesInRadius - zombiesInRadius.Count);
-            SendConsoleMessage($"(ZombieRadius) Spawning {amountToSpawn} zombies near player {player.displayName}");
-
-            if (amountToSpawn > 0)
-            {
-                StartPlayerSpawning(player, amountToSpawn);
-            }
+            // Get the amount to spawn
+            var amount = Random.Range(MinScanSpawnAmount, MaxScanSpawnAmount);
+            SendConsoleMessage($"(OnCheckZombieRadius) Spawning {amount} zombies near player {player.displayName}");
+            StartPlayerSpawning(player, amount, MinScanSpawnRadius, MaxScanSpawnRadius);
         }
 
         private BaseCorpse OnCorpsePopulate(BasePlayer npcPlayer, NPCPlayerCorpse corpse)
         {
             if (npcPlayer is ScarecrowNPC)
             {
-                // Zombie loot configuration
-                foreach (var item in corpse.containers)
+                // Chance of getting good loot
+                var chance = Random.Range(1, 4);
+                if (chance == 3)
                 {
-                    // Scrap
-                    var scrap = ItemManager.FindItemDefinition("scrap");
-                    if (scrap != null)
+                    return null;
+                }
+                
+                // Otherwise default
+                for (var i = 0; i < corpse.containers.Length; i++)
+                {
+                    var itemIndex = _zombieLootTable.FirstOrDefault(z => z.Index == i);
+                    if (itemIndex is null)
                     {
-                        item.AddItem(scrap, Random.Range(1, MaxScrapLoot));
+                        break;
                     }
 
-                    // Low chance of blood
-                    var chance = Random.Range(0, 15);
-                    if (chance == 5)
+                    var item = ItemManager.FindItemDefinition(itemIndex.Name);
+                    if (item != null)
                     {
-                        var blood = ItemManager.FindItemDefinition("blood");
-                        if (blood != null)
-                        {
-                            item.AddItem(blood, 1);
-                        }
-                    }
-
-                    // Fragments
-                    var fragments = ItemManager.FindItemDefinition("bone.fragments");
-                    if (fragments != null)
-                    {
-                        item.AddItem(fragments, Random.Range(0, 5));
+                        corpse.containers[i].AddItem(item, Random.Range(itemIndex.MinAmount, itemIndex.MaxAmount));
                     }
                 }
 
-                // Remove the corpse to avoid exploit
-                corpse.Kill();
+                // Note: Might be worth doing this, as many corpses can lag the server
+                //corpse.Kill();
                 return corpse;
             }
 
@@ -621,7 +783,7 @@ namespace Oxide.Plugins
 
         private void OnEntityDeath(BaseCombatEntity entity, HitInfo info)
         {
-            //Puts($"Prefab name: {entity.name} | PrefabID: {entity.prefabID}");
+            // Player killed zombie
             if (entity is ScarecrowNPC)
             {
                 var target = entity as ScarecrowNPC;
@@ -633,11 +795,10 @@ namespace Oxide.Plugins
                         return;
                     }
 
-                    _totalZombiesKilled++;
-                    IncreaseZombieKills(player);
+                    var comEnt = entity as BaseCombatEntity;
 
-                    var zombiesOnMap = GetEntitiesByPrefabId(ZombiePrefabID).Count;
-                    SendServerAnnouncement($"{Format(player.displayName, Green)} killed zombie {Format(target.displayName, Red)}. {Format(_totalZombiesKilled, Red)} zombies have been killed, there are {zombiesOnMap} left.");
+                    IncreaseZombieKills(player);
+                    SendPlayerMessage(player, $"You killed {Format(target.displayName, PrimaryRed)}");
                 }
             }
         }
@@ -659,7 +820,7 @@ namespace Oxide.Plugins
             }
 
             var amount = int.Parse(args[0]);
-            StartPlayerSpawning(player, amount);
+            StartPlayerSpawning(player, amount, MinScanSpawnAmount, MaxScanSpawnAmount);
         }
 
         private void ClearZombiesCommand(BasePlayer player, string command, string[] args)
@@ -673,7 +834,7 @@ namespace Oxide.Plugins
             ClearAllZombies();
 
             var amountOfZombies = GetEntitiesByPrefabId(ZombiePrefabID).Count;
-            SendPlayerMessage(player, $"Zombies destroyed, population is now: {Format(amountOfZombies, Red)}");
+            SendPlayerMessage(player, $"Zombies destroyed, population is now: {Format(amountOfZombies, PrimaryRed)}");
         }
 
         private void GetZombieCountCommand(BasePlayer player, string command, string[] args)
@@ -685,7 +846,7 @@ namespace Oxide.Plugins
             }
 
             var amountOfZombies = GetEntitiesByPrefabId(ZombiePrefabID).Count;
-            SendPlayerMessage(player, $"Current Zombie Population: {Format(amountOfZombies, Red)}");
+            SendPlayerMessage(player, $"Current Zombie Population: {Format(amountOfZombies, PrimaryRed)}");
         }
 
         private void RegenerateZombiesCommand(BasePlayer player, string command, string[] args)
@@ -705,13 +866,13 @@ namespace Oxide.Plugins
             var amount = int.Parse(args[0]);
             var amountOfZombies = GetEntitiesByPrefabId(ZombiePrefabID).Count;
 
-            SendPlayerMessage(player, $"Pre-Regenerate Pop: {Format(amountOfZombies, Red)}");
+            SendPlayerMessage(player, $"Pre-Regenerate Pop: {Format(amountOfZombies, PrimaryRed)}");
 
             ClearAllZombies();
             StartMapSpawning(amount);
 
             amountOfZombies = GetEntitiesByPrefabId(ZombiePrefabID).Count;
-            SendPlayerMessage(player, $"Post-Regenerate Pop: {Format(amountOfZombies, Red)}");
+            SendPlayerMessage(player, $"Post-Regenerate Pop: {Format(amountOfZombies, PrimaryRed)}");
         }
 
         private void GetZombieRadiusCountCommand(BasePlayer player, string command, string[] args)
@@ -730,26 +891,46 @@ namespace Oxide.Plugins
 
             var radius = int.Parse(args[0]);
             var radiusCount = GetEntitiesWithinRadius(player.transform.position, radius, ZombiePrefabID);
-            SendPlayerMessage(player, $"There are {Format(radiusCount.Count, Red)} zombies within a {Format(radius, Green)} radius of you");
+            SendPlayerMessage(player, $"There are {Format(radiusCount.Count, PrimaryRed)} zombies within a {Format(radius, Green)} radius of you");
         }
         #endregion
+        #endregion
+
+        #region Feature:Scientists (TODO)
+        public void InitScientists()
+        {
+
+
+        }
+
+
         #endregion
 
         #region Feature:Stats
         public void IncreaseZombieKills(BasePlayer player)
         {
-            _connectedPlayers
-                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
-                .ZombieStats
-                .ZombieKills++;
+            var stats = _connectedPlayers
+                .FirstOrDefault(p => p.Owner == player)
+                .ZombieStats;
+            stats.ZombieKills++;
 
             RegenerateUI(player);
+
+            // Check to see if we announce a new title
+            var rangeKey = _zombiePlayerTitles.Keys.FirstOrDefault(key => IsInRange(stats.ZombieKills, key));
+            string playerTitle = _zombiePlayerTitles[rangeKey];
+
+            if (playerTitle != stats.Title)
+            {
+                stats.Title = playerTitle;
+                SendServerAnnouncement($"{Format(player.displayName, Green)} has earned the title {Format(playerTitle, Yellow)} from killing {Format(stats.ZombieKills, PrimaryRed)} zombies.");
+            }
         }
 
         public void IncreasePlayerDeaths(BasePlayer player)
         {
             _connectedPlayers
-                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
+                .FirstOrDefault(p => p.Owner == player)
                 .ZombieStats
                 .DeathByZombie++;
 
@@ -757,12 +938,12 @@ namespace Oxide.Plugins
         }
 
         public int GetZombieKills(BasePlayer player ) => _connectedPlayers
-                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
+                .FirstOrDefault(p => p.Owner == player)
                 .ZombieStats
                 .ZombieKills;
 
         public int GetDeathByZombie(BasePlayer player) => _connectedPlayers
-                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
+                .FirstOrDefault(p => p.Owner == player)
                 .ZombieStats
                 .DeathByZombie;
         #endregion
@@ -775,35 +956,58 @@ namespace Oxide.Plugins
         {
             if (player == null) return;
 
+            var playerStats = _connectedPlayers
+                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
+                .ZombieStats;
+
             // Destory previous UI
             DestroyPlayerUI(player);
 
+            var panelName = $"{player.OwnerID}-zhud";
             var container = new CuiElementContainer();
+
+            // Block container
             var panel = new CuiPanel
             {
-                Image = { Color = "0.1 0.1 0.1 0.4" },
-                RectTransform = { AnchorMin = "0.01 0.9", AnchorMax = "0.1 0.99" },
+                Image = { Color = "0.1 0.1 0.1 0" },
+                RectTransform = { AnchorMin = "0.01 0.6", AnchorMax = "0.4 0.9" },
                 CursorEnabled = false
             };
-            var panelName = $"{player.OwnerID}-zhud";
             container.Add(panel, "Hud", panelName);
 
-            var playerStats = GetZombieStats(player);
-
-            var hudTitle = new CuiLabel
+            // Title
+            var titleLabel = new CuiLabel
             {
-                Text = { Text = $"ZM v{Version}", FontSize = 16, Align = TextAnchor.UpperLeft, Color = "0.859 0.039 0.039 1" },
-                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "1 1" }
+                Text = { Text = $"<{playerStats.Title}> {player.displayName}", FontSize = 12, Align = TextAnchor.MiddleLeft, Color = "0.996 0.678 0 1" },
+                RectTransform = { AnchorMin = "0.01 0.6", AnchorMax = "1 1" }
             };
-            container.Add(hudTitle, panelName);
+            container.Add(titleLabel, panelName);
 
-            var text = new CuiLabel
+            // Stats
+            var statsLabel = new CuiLabel
             {
-                Text = { Text = $"\nGlobal Zombie Kills: {_totalZombiesKilled}\n{playerStats}", FontSize = 12, Align = TextAnchor.MiddleLeft, Color = "0.647 0.067 0.067 1" },
-                RectTransform = { AnchorMin = "0.05 0", AnchorMax = "1 1" }
+                Text = { Text = playerStats.ToString(), FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0.248 0.8 0 1" },
+                RectTransform = { AnchorMin = "0.01 0.4", AnchorMax = "1 1" }
             };
-            container.Add(text, panelName);
+            container.Add(statsLabel, panelName);
 
+            // Online players
+            StringBuilder sb = new StringBuilder();
+            sb.Append($"Online Players\n");
+            sb.Append($"--------------\n");
+            foreach (var onlinePlayer in BasePlayer.activePlayerList)
+            {
+                sb.Append($"{onlinePlayer.displayName}\n");
+            }
+
+            var onlineLabel = new CuiLabel
+            {
+                Text = { Text = sb.ToString(), FontSize = 9, Align = TextAnchor.LowerLeft, Color = "#B4F800" },
+                RectTransform = { AnchorMin = "0.01 0.03", AnchorMax = "1 1" }
+            };
+            container.Add(onlineLabel, panelName);
+
+            // Add container to UI and cache
             CuiHelper.AddUi(player, container);
             _playerUIs[player.OwnerID] = panelName;
         }
@@ -815,14 +1019,23 @@ namespace Oxide.Plugins
                 CuiHelper.DestroyUi(player, panelName);
             }
         }
-
-        private string GetZombieStats(BasePlayer player) =>
-            _connectedPlayers
-            .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
-            .ZombieStats.ToString();
         #endregion
 
         #region Helpers and Others
+        private bool IsInRange(int number, string range)
+        {
+            string[] parts = range.Split('-');
+            if (parts.Length != 2)
+            {
+                return false;
+            }
+
+            int min = int.Parse(parts[0]);
+            int max = int.Parse(parts[1]);
+
+            return number >= min && number <= max;
+        }
+
         private List<BaseEntity> GetEntitiesWithinRadius(Vector3 position, float radius, uint prefabId)
         {
             List<BaseEntity> entities = new List<BaseEntity>();
@@ -899,9 +1112,9 @@ namespace Oxide.Plugins
             return entities;
         }
 
-        private void SendPlayerMessage(BasePlayer player, string msg) => Player.Message(player, msg, ChatPrefix);
+        private void SendPlayerMessage(BasePlayer player, string msg) => Player.Message(player, msg, $"{ChatPrefix}<color={SecondaryRed}>");
 
-        private void SendServerAnnouncement(string msg) => Server.Broadcast(msg, ChatPrefix);
+        private void SendServerAnnouncement(string msg) => Server.Broadcast(msg, $"{ChatPrefix}<color={SecondaryRed}>");
 
         private void SendConsoleMessage(string msg) => Puts($"{Prefix} {msg}");
 
@@ -909,6 +1122,17 @@ namespace Oxide.Plugins
         #endregion
 
         #region Models
+        internal class ZombieLootTableItem
+        {
+            public int Index { get; set; }
+
+            public string Name { get; set; }
+
+            public int MinAmount { get; set; }
+
+            public int MaxAmount { get; set; } 
+        }
+
         internal class PlayerStats
         {
             public BasePlayer Owner { get; set; }
@@ -925,13 +1149,20 @@ namespace Oxide.Plugins
 
         internal class PlayerZombieStats
         {
+            public string Title { get; set; }
+
             public int ZombieKills { get; set; }
 
             public int DeathByZombie { get; set; }
 
+            public PlayerZombieStats()
+            {
+                Title = _zombiePlayerTitles.FirstOrDefault().Value;
+            }
+
             public override string ToString()
             {
-                return $"Zombie Kills: {ZombieKills}\nDeaths by Zombie: {DeathByZombie}";
+                return $"Zombie Kills: {ZombieKills} \nDeaths by Zombie: {DeathByZombie}";
             }
         }
         #endregion
