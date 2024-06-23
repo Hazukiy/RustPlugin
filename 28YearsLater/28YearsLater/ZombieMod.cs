@@ -27,24 +27,24 @@ using CompanionServer.Handlers;
 using static ConsoleSystem;
 using Steamworks.ServerList;
 using System.Text;
+using System.Threading;
+using Network;
+using System.Xml.Linq;
+using static Oxide.Plugins.ZombieMod;
+using System.Net.Mail;
 
 namespace Oxide.Plugins
 {
-    [Info("ZombieMod", "Luke", "1.0.1")]
+    [Info("ZombieMod", "My Back Hurts", "1.0.2")]
     [Description("Zombie mod for Rust")]
     class ZombieMod : RustPlugin
     {
-        #region Core
-        private const string Version = "1.0.1";
-        private const string Blue = "#011575";
+        private const string Prefix = "[ZM]";
         private const string Green = "#1cbf68";
-
         private const string PrimaryRed = "#DF3434";
         private const string SecondaryRed = "#BD2323";
-
-        private const string Orange = "#ED7A00";
         private const string Yellow = "#DFEC08";
-        private const string Prefix = "[ZM]";
+        private string Version = "v1.0.2";
         private string ChatPrefix = $"<color={SecondaryRed}>{Prefix}</color>";
 
         // The delay between general messages
@@ -56,17 +56,20 @@ namespace Oxide.Plugins
         private List<BasePlayer> _voteDayPlayers;
         private Timer _voteDayTimeout;
         private Timer _voteDayCooldown;
+        private DateTime _loadTime;
 
         // Cache
         private Dictionary<ulong, bool> godModePlayers;
-        private List<PlayerStats> _connectedPlayers;
-        private Hash<ulong, bool> noclipPlayers;
 
+        // Data
+        private Hash<ulong, bool> noclipPlayers;
+        private StoredData _storedData;
+
+        #region Core:Plugin
         private void Init()
         {
             godModePlayers = new Dictionary<ulong, bool>();
             noclipPlayers = new Hash<ulong, bool>();
-            _connectedPlayers = new List<PlayerStats>();
             _voteDayPlayers = new List<BasePlayer>();
 
             // Register general commands
@@ -76,71 +79,44 @@ namespace Oxide.Plugins
             // Admin
             cmd.AddChatCommand("godmode", this, nameof(ToggleGodModeCommand));
             cmd.AddChatCommand("heal", this, nameof(HealCommand));
+            cmd.AddChatCommand("savedata", this, nameof(SaveDataCommand));
+
+            _loadTime = DateTime.Now;
+            Version += $"-b{_loadTime:HH.mm.ss}";
         }
 
         private void Unload()
         {
+            SaveData();
+
             foreach (var player in BasePlayer.activePlayerList)
             {
                 DestroyPlayerUI(player);
             }
 
             _playerUIs.Clear();
-            _connectedPlayers.Clear();
             _voteDayPlayers.Clear();
             godModePlayers.Clear();
+            _playerHudTimers.Clear();
 
+            _playerHudTimers = null;
             _voteDayTimeout = null;
             _voteDayCooldown = null;
-            _connectedPlayers = null;
             _zombieSpawnTimer = null;
             godModePlayers = null;
         }
+        #endregion
 
-        public void BuildPlayer(BasePlayer player)
+        #region Core:Server
+        private void OnServerSave()
         {
-            var playerData = _connectedPlayers.FirstOrDefault(p => p.Owner == player);
-            if (playerData == null)
-            {
-                var stats = new PlayerStats()
-                {
-                    Owner = player
-                };
-                stats.BaseStats.JoinedTime = DateTime.Now;
-                _connectedPlayers.Add(stats);
-            }
-
-            // Generate UI
-            RegenerateUI(player);
-
-            // Start zombie scan timer
-            if (!_playerScanTimer.TryGetValue(player, out Timer scanTimer))
-            {
-                scanTimer = timer.Every(ScanTimerInterval, () => OnCheckZombieRadius(player));
-
-                // Add
-                _playerScanTimer.Add(player, scanTimer);
-            }
+            SaveData();
         }
 
-        private void DestroyPlayer(BasePlayer player)
-        {
-            // Remove stats
-            _connectedPlayers.Remove(_connectedPlayers.FirstOrDefault(p => p.Owner == player));
-
-            // Remove zombie spawn timer
-            if (_playerScanTimer.TryGetValue(player, out Timer playerTimer))
-            {
-                playerTimer.Destroy();
-                _playerScanTimer.Remove(player);
-            }
-
-            SendConsoleMessage($"Cleaned up player {player.displayName} after disconnect.");
-        }
-
-        #region General Hooks & Events
         private void OnServerInitialized()
         {
+            LoadData();
+
             // Start timer for broadcasting server time
             timer.Every(ReportTimeDelay, () =>
             {
@@ -149,8 +125,8 @@ namespace Oxide.Plugins
 
             // Get zombies
             var zombieCount = GetEntitiesByPrefabId(ZombiePrefabID).Count;
-            SendServerAnnouncement($"ZombieMod {Format($"v{Version}", Green)} successfully loaded. {zombieCount} zombies currently on map.");
-            SendConsoleMessage($"ZombieMod v{Version} successfully loaded.");
+            SendServerAnnouncement($"ZombieMod {Format(Version, Green)} successfully loaded with {Format(zombieCount, Green)} zombies currently on the map.");
+            SendConsoleMessage($"ZombieMod {Version} successfully loaded.");
 
             // Initialise zombies
             InitZombies();
@@ -160,6 +136,50 @@ namespace Oxide.Plugins
             {
                 BuildPlayer(player);
             }
+            SaveData();
+
+            // Reload everyone's UI 
+            ReloadAllPlayerUI();
+        }
+
+        private void OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
+        {
+            BasePlayer player = entity as BasePlayer;
+
+            // Check godmode
+            if (player != null && player.IsConnected)
+            {
+                if (godModePlayers.ContainsKey(player.userID) && godModePlayers[player.userID])
+                {
+                    info.damageTypes = new DamageTypeList();
+                    info.HitMaterial = 0;
+                    info.PointStart = Vector3.zero;
+                    info.PointEnd = Vector3.zero;
+                }
+                else
+                {
+                    if (info.Initiator is ScarecrowNPC)
+                    {
+                        // Apply the damage multiplier
+                        info.damageTypes.ScaleAll(DamageMultiplier);
+                    }
+                }
+            }
+        }
+        #endregion
+
+        #region Core:Player
+        private object OnPlayerChat(BasePlayer player, string message, Chat.ChatChannel channel)
+        {
+            // Prevent override for emojis
+            if (message.StartsWith(':') || channel != Chat.ChatChannel.Global)
+            {
+                return null;
+            }
+
+            var title = _storedData.PlayerData[player.userID];
+            Server.Broadcast(message, $"[{channel}] (<color={title.ZombieStats.ZombieTitle.HexColour}>{title.ZombieStats.ZombieTitle.Title}</color>) <color={title.ZombieStats.ZombieTitle.NameColour}>{player.displayName}</color>", player.userID);
+            return true; 
         }
 
         private void OnPlayerConnected(BasePlayer player)
@@ -181,21 +201,7 @@ namespace Oxide.Plugins
             DestroyPlayer(player);
 
             // Regenerate UI
-            // Rebuild each player
-            ReloadAllPlayerUI();
-        }
-
-        private void ReloadAllPlayerUI()
-        {
-            // Get online players only
-            var online = BasePlayer.activePlayerList.Where(p => p.IsConnected);
-            if (online != null)
-            {
-                foreach (var player in online)
-                {
-                    RegenerateUI(player);
-                }
-            }
+            //ReloadAllPlayerUI();
         }
 
         private object OnPlayerDeath(BasePlayer player, HitInfo info)
@@ -232,33 +238,61 @@ namespace Oxide.Plugins
             }
         }
 
-        private void OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
+        public void BuildPlayer(BasePlayer player)
         {
-            BasePlayer player = entity as BasePlayer;
+            if (player == null) return;
 
-            // Check godmode
-            if (player != null && player.IsConnected)
+            var playerData = _storedData.PlayerData[player.userID];
+            if (playerData == null)
             {
-                if (godModePlayers.ContainsKey(player.userID) && godModePlayers[player.userID])
+                SendConsoleMessage($"{player.displayName} is new, creating new record");
+                _storedData.PlayerData.Add(player.userID, new PlayerStats()
                 {
-                    info.damageTypes = new DamageTypeList();
-                    info.HitMaterial = 0;
-                    info.PointStart = Vector3.zero;
-                    info.PointEnd = Vector3.zero;
-                }
-                else
-                {
-                    if (info.Initiator is ScarecrowNPC)
-                    {
-                        // Apply the damage multiplier
-                        info.damageTypes.ScaleAll(DamageMultiplier);
-                    }
-                }
+                    Name = player.displayName,
+                    FirstConnection = DateTime.Now
+                });
             }
+
+            _storedData.PlayerData[player.userID].Name = player.displayName;
+
+            // Start zombie scan timer
+            if (!_playerScanTimer.TryGetValue(player, out Timer scanTimer))
+            {
+                _playerScanTimer.Add(player, timer.Every(ScanTimerInterval, () => OnCheckZombieRadius(player)));
+            }
+
+            // Start hud timer
+            if (!_playerHudTimers.TryGetValue(player, out Timer hudTimer))
+            {
+                _playerHudTimers.Add(player, timer.Every(_hudTick, () => RegenerateUI(player)));
+            }
+        }
+
+        private void DestroyPlayer(BasePlayer player)
+        {
+            if (player == null) return;
+
+            SaveData();
+
+            // Remove zombie spawn timer
+            if (_playerScanTimer.TryGetValue(player, out Timer playerTimer))
+            {
+                playerTimer.Destroy();
+                _playerScanTimer.Remove(player);
+            }
+
+            // Remove update hud 
+            if (_playerHudTimers.TryGetValue(player, out Timer hudTimer))
+            {
+                hudTimer.Destroy();
+                _playerHudTimers.Remove(player);
+            }
+
+            SendConsoleMessage($"Cleaned up player {player.displayName} after disconnect.");
         }
         #endregion
 
-        #region General Commands
+        #region Core:Commands
         private void ToggleGodModeCommand(BasePlayer player, string command, string[] args)
         {
             if (player == null) return;
@@ -378,8 +412,39 @@ namespace Oxide.Plugins
                 return;
             }
         }
+
+        private void SaveDataCommand(BasePlayer player, string command, string[] args)
+        {
+            if (player == null) return;
+
+            if (!player.IsAdmin)
+            {
+                SendPlayerMessage(player, "Nope :/");
+                return;
+            }
+
+            SaveData();
+            SendPlayerMessage(player, "Saved.");
+        }
         #endregion
+
+        #region Core:DataFileSystem 
+        public void LoadData()
+        {
+            _storedData = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name);
+            SendConsoleMessage($"Loaded {_storedData.PlayerData.Count} records.");
+        }
+
+        public void SaveData()
+        {
+            SendConsoleMessage("Saving file data.");
+            Interface.Oxide.DataFileSystem.WriteObject(Name, _storedData);
+        }
         #endregion
+
+
+
+
 
         #region Feature:Zombies
         private const string ZombiePrefab = "assets/prefabs/npc/scarecrow/scarecrow.prefab";
@@ -549,20 +614,6 @@ namespace Oxide.Plugins
             new ZombieLootTableItem() { Index = 0, Name = "scrap", MinAmount = 5, MaxAmount = 10 },
             new ZombieLootTableItem() { Index = 1, Name = "bone.fragments", MinAmount = 5, MaxAmount = 10 },
         };
-        private static Dictionary<string, string> _zombiePlayerTitles = new Dictionary<string, string>()
-        {
-            { "0-9", "Zombie Bait" },
-            { "10-19", "Novice Survivor" },
-            { "20-29", "Grizzled Fighter" },
-            { "30-39", "Undead Slayer" },
-            { "40-49", "Zombie Hunter" },
-            { "50-59", "Apocalypse Survivor" },
-            { "60-69", "Zombie Annihilator" },
-            { "70-79", "Ultimate Undead Slayer" },
-            { "80-89", "Zombie Exterminator" },
-            { "90-99", "Legendary Apocalypse Survivor" },
-            { "100+", "Master of the Undead" }
-        };
 
         private const float DamageMultiplier = 0.3f; // How much damage a zombie does to the player
         private Timer _zombieSpawnTimer;
@@ -573,10 +624,10 @@ namespace Oxide.Plugins
         private const int MaxZombies = 1500;
         private const int MinPerRegen = 5; // Min amount of zombies to respawn around map
         private const int MaxPerRegen = 20; // How many zombies can be spawned on the map at a single time
-        private float ZombieSpawnTime = (float)TimeSpan.FromMinutes(15).TotalSeconds; // How often to spawn zombies on the map 
+        private float ZombieSpawnTime = (float)TimeSpan.FromMinutes(10).TotalSeconds; // How often to spawn zombies on the map 
 
         // Base Zombie Radius
-        private const float MinSpawnRadius = 100.0f;
+        private const float MinSpawnRadius = 160.0f;
         private const float MaxSpawnRadius = 300.0f;
 
         // Zombie properties
@@ -587,7 +638,7 @@ namespace Oxide.Plugins
         private const int MaxScrapLoot = 5;
 
         // Zombie scan
-        private float ScanTimerInterval = (float)TimeSpan.FromMinutes(10).TotalSeconds;
+        private float ScanTimerInterval = (float)TimeSpan.FromMinutes(7).TotalSeconds;
         private const float MinScanSpawnRadius = 60.0f;
         private const float MaxScanSpawnRadius = 100.0f;
         private const int MinScanSpawnAmount = 2;
@@ -703,7 +754,7 @@ namespace Oxide.Plugins
             inventory.itemList.Clear();
 
             // Add weapon
-            var itemDef = ItemManager.FindItemDefinition("knife.bone");
+            var itemDef = ItemManager.FindItemDefinition("knife.bone"); // 
             if (itemDef != null)
             {
                 Item weaponItem = ItemManager.CreateByItemID(itemDef.itemid, 1, 1277364396);
@@ -794,8 +845,6 @@ namespace Oxide.Plugins
                     {
                         return;
                     }
-
-                    var comEnt = entity as BaseCombatEntity;
 
                     IncreaseZombieKills(player);
                     SendPlayerMessage(player, $"You killed {Format(target.displayName, PrimaryRed)}");
@@ -896,6 +945,177 @@ namespace Oxide.Plugins
         #endregion
         #endregion
 
+        #region Feature:Stats
+        public void IncreaseZombieKills(BasePlayer player)
+        {
+            var stats = _storedData.PlayerData[player.userID]
+                .ZombieStats;
+            stats.ZombieKills++;
+
+            // Get the title
+            var zombieTitle = ZombieTitle
+                .GetZombieTitles()
+                .FirstOrDefault(z => IsInRange(stats.ZombieKills, z.KillRange));
+
+            if (zombieTitle.Title != stats.ZombieTitle.Title)
+            {
+                stats.ZombieTitle = zombieTitle;
+                SendServerAnnouncement($"{Format(player.displayName, PrimaryRed)} has earned the title {Format(zombieTitle.Title, Green)} from killing {Format(stats.ZombieKills, PrimaryRed)} zombies.");
+            }
+
+            SaveData();
+
+            // Regenerate all UIs
+            ReloadAllPlayerUI();         
+        }
+
+        public void IncreasePlayerDeaths(BasePlayer player)
+        {
+            _storedData.PlayerData[player.userID]
+                .ZombieStats
+                .DeathByZombie++;
+
+            SaveData();
+
+            RegenerateUI(player);
+        }
+
+        public int GetZombieKills(BasePlayer player) => _storedData.PlayerData[player.userID]
+                .ZombieStats
+                .ZombieKills;
+
+        public int GetDeathByZombie(BasePlayer player) => _storedData.PlayerData[player.userID]
+                .ZombieStats
+                .DeathByZombie;
+        #endregion
+
+        #region Feature:HUD
+        private float _hudTick = (float)TimeSpan.FromMinutes(1).TotalSeconds;
+        private Dictionary<BasePlayer, string> _playerUIs = new Dictionary<BasePlayer, string>();
+        private Dictionary<BasePlayer, Timer> _playerHudTimers = new Dictionary<BasePlayer, Timer>();
+
+        private void RegenerateUI(BasePlayer player)
+        {
+            if (player == null) return;
+
+            // Destory previous UI
+            DestroyPlayerUI(player);
+
+            // Get online players
+            var playerStats = _storedData.PlayerData[player.userID];
+            var onlinePlayers = GetOnlinePlayers();
+            var panelName = $"{player.userID}-zhud";
+
+            // Add UI
+            CuiHelper.AddUi(player, new CuiElementContainer
+            {
+                // PANEL: Main hud 
+                {
+                    new CuiPanel
+                    {
+                        Image = { Color = "0.1 0.1 0.1 0" },
+                        RectTransform = { AnchorMin = "0.01 0", AnchorMax = "0.2 1" },
+                        CursorEnabled = false
+                    },
+                    "Hud",
+                    panelName
+                },
+
+                // LABEL: Version
+                {
+                    new CuiLabel
+                    {
+                        Text = { Text = $"ZombieMod {Version}", FontSize = 9, Align = TextAnchor.LowerLeft, Color = "0.470 0.736 0.111 0.6" },
+                        RectTransform = { AnchorMin = "0.01 0.01", AnchorMax = "1 1" }
+                    },
+                    panelName
+                },
+
+                // LABEL: Name Title
+                {
+                    new CuiLabel
+                    {
+                        Text = { Text = $"Welcome, {playerStats.Name}", FontSize = 12, Align = TextAnchor.MiddleLeft, Color = "0.870 0.236 0.111 1" },
+                        RectTransform = { AnchorMin = "0.01 0.645", AnchorMax = "1 1" }
+                    },
+                    panelName
+                },
+
+                // LABEL: Zombie Title
+                {
+                    new CuiLabel
+                    {
+                        Text = { Text = $"Level {ZombieTitle.GetTitleIndex(playerStats.ZombieStats.ZombieTitle.Title)+1} - {playerStats.ZombieStats.ZombieTitle.Title}", FontSize = 10, Align = TextAnchor.MiddleLeft, Color = playerStats.ZombieStats.ZombieTitle.Colour },
+                        RectTransform = { AnchorMin = "0.01 0.61", AnchorMax = "1 1" }
+                    },
+                    panelName
+                },
+
+                // LABEL: Stats
+                {
+                    new CuiLabel
+                    {
+                        Text = { Text = playerStats.ToString(), FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0.870 0.536 0.111 1" },
+                        RectTransform = { AnchorMin = "0.01 0.53", AnchorMax = "1 1" }
+                    },
+                    panelName
+                },
+
+                // LABEL: Online players
+                {
+                    new CuiLabel
+                    {
+                        Text = { Text = onlinePlayers, FontSize = 8, Align = TextAnchor.MiddleLeft, Color = "0.170 0.536 0.111 1" },
+                        RectTransform = { AnchorMin = "0.01 0.3", AnchorMax = "1 1" }
+                    },
+                    panelName
+                }
+            });
+
+            // Add container to UI and cache
+            _playerUIs[player] = panelName;
+        }
+
+        private void DestroyPlayerUI(BasePlayer player)
+        {
+            if (_playerUIs.TryGetValue(player, out string panelName))
+            {
+                CuiHelper.DestroyUi(player, panelName);
+            }
+        }
+
+        private void ReloadAllPlayerUI()
+        {
+            // Get online players only
+            var online = BasePlayer.activePlayerList.Where(p => p != null && p.IsConnected).ToList();
+            if (online != null)
+            {
+                foreach (var player in online)
+                {
+                    RegenerateUI(player);
+                }
+            }
+        }
+
+        private string GetOnlinePlayers()
+        {
+            // Online players
+            var sb = new StringBuilder();
+            sb.Append($"Online Players\n");
+            sb.Append($"----------------\n");
+
+            var order = 1;
+            foreach (var onlinePlayer in _storedData.PlayerData.OrderByDescending(p => p.Value.ZombieStats.ZombieKills))
+            {
+                sb.Append($"{order}. {onlinePlayer.Value.Name} ({onlinePlayer.Value.ZombieStats.ZombieKills} kills {onlinePlayer.Value.ZombieStats.DeathByZombie} deaths)\n");
+                order++;
+            }
+
+            return sb.ToString();
+        }
+
+        #endregion
+
         #region Feature:Scientists (TODO)
         public void InitScientists()
         {
@@ -904,121 +1124,6 @@ namespace Oxide.Plugins
         }
 
 
-        #endregion
-
-        #region Feature:Stats
-        public void IncreaseZombieKills(BasePlayer player)
-        {
-            var stats = _connectedPlayers
-                .FirstOrDefault(p => p.Owner == player)
-                .ZombieStats;
-            stats.ZombieKills++;
-
-            RegenerateUI(player);
-
-            // Check to see if we announce a new title
-            var rangeKey = _zombiePlayerTitles.Keys.FirstOrDefault(key => IsInRange(stats.ZombieKills, key));
-            string playerTitle = _zombiePlayerTitles[rangeKey];
-
-            if (playerTitle != stats.Title)
-            {
-                stats.Title = playerTitle;
-                SendServerAnnouncement($"{Format(player.displayName, Green)} has earned the title {Format(playerTitle, Yellow)} from killing {Format(stats.ZombieKills, PrimaryRed)} zombies.");
-            }
-        }
-
-        public void IncreasePlayerDeaths(BasePlayer player)
-        {
-            _connectedPlayers
-                .FirstOrDefault(p => p.Owner == player)
-                .ZombieStats
-                .DeathByZombie++;
-
-            RegenerateUI(player);
-        }
-
-        public int GetZombieKills(BasePlayer player ) => _connectedPlayers
-                .FirstOrDefault(p => p.Owner == player)
-                .ZombieStats
-                .ZombieKills;
-
-        public int GetDeathByZombie(BasePlayer player) => _connectedPlayers
-                .FirstOrDefault(p => p.Owner == player)
-                .ZombieStats
-                .DeathByZombie;
-        #endregion
-
-        #region Feature:HUD
-        private Dictionary<ulong, string> _playerUIs = new Dictionary<ulong, string>();
-        private float HudTick = 1.0f;
-
-        private void RegenerateUI(BasePlayer player)
-        {
-            if (player == null) return;
-
-            var playerStats = _connectedPlayers
-                .FirstOrDefault(p => p.Owner.OwnerID == player.OwnerID)
-                .ZombieStats;
-
-            // Destory previous UI
-            DestroyPlayerUI(player);
-
-            var panelName = $"{player.OwnerID}-zhud";
-            var container = new CuiElementContainer();
-
-            // Block container
-            var panel = new CuiPanel
-            {
-                Image = { Color = "0.1 0.1 0.1 0" },
-                RectTransform = { AnchorMin = "0.01 0.6", AnchorMax = "0.4 0.9" },
-                CursorEnabled = false
-            };
-            container.Add(panel, "Hud", panelName);
-
-            // Title
-            var titleLabel = new CuiLabel
-            {
-                Text = { Text = $"<{playerStats.Title}> {player.displayName}", FontSize = 12, Align = TextAnchor.MiddleLeft, Color = "0.996 0.678 0 1" },
-                RectTransform = { AnchorMin = "0.01 0.6", AnchorMax = "1 1" }
-            };
-            container.Add(titleLabel, panelName);
-
-            // Stats
-            var statsLabel = new CuiLabel
-            {
-                Text = { Text = playerStats.ToString(), FontSize = 10, Align = TextAnchor.MiddleLeft, Color = "0.248 0.8 0 1" },
-                RectTransform = { AnchorMin = "0.01 0.4", AnchorMax = "1 1" }
-            };
-            container.Add(statsLabel, panelName);
-
-            // Online players
-            StringBuilder sb = new StringBuilder();
-            sb.Append($"Online Players\n");
-            sb.Append($"--------------\n");
-            foreach (var onlinePlayer in BasePlayer.activePlayerList)
-            {
-                sb.Append($"{onlinePlayer.displayName}\n");
-            }
-
-            var onlineLabel = new CuiLabel
-            {
-                Text = { Text = sb.ToString(), FontSize = 9, Align = TextAnchor.LowerLeft, Color = "#B4F800" },
-                RectTransform = { AnchorMin = "0.01 0.03", AnchorMax = "1 1" }
-            };
-            container.Add(onlineLabel, panelName);
-
-            // Add container to UI and cache
-            CuiHelper.AddUi(player, container);
-            _playerUIs[player.OwnerID] = panelName;
-        }
-
-        private void DestroyPlayerUI(BasePlayer player)
-        {
-            if (_playerUIs.TryGetValue(player.OwnerID, out string panelName))
-            {
-                CuiHelper.DestroyUi(player, panelName);
-            }
-        }
         #endregion
 
         #region Helpers and Others
@@ -1122,6 +1227,100 @@ namespace Oxide.Plugins
         #endregion
 
         #region Models
+
+        internal class ZombieTitle
+        {
+            public string Title { get; set; }
+
+            public string KillRange { get; set; }
+
+            public string Colour { get; set; }
+
+            public string HexColour { get; set; }
+
+            public string NameColour { get; set; }
+
+            private static (string, string) GenerateColour(double progress, double startR, double startG, double startB, double endR, double endG, double endB)
+            {
+                double r = startR + progress * (endR - startR);
+                double g = startG + progress * (endG - startG);
+                double b = startB + progress * (endB - startB);
+
+                string rgbaColour = $"{r:F3} {g:F3} {b:F3} 1";
+                string hexColour = $"#{(int)(r * 255):X2}{(int)(g * 255):X2}{(int)(b * 255):X2}";
+
+                return (rgbaColour, hexColour);
+            }
+
+            public static int GetTitleIndex(string title)
+            {
+                var titles = GetZombieTitles();
+                for (int i = 0; i < titles.Count; i++)
+                {
+                    if (titles[i].Title.Equals(title, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return i;
+                    }
+                }
+                return -1; // Return -1 if the title is not found
+            }
+
+            public static List<ZombieTitle> GetZombieTitles()
+            {
+                var titles = new List<ZombieTitle>
+                {
+                    new ZombieTitle { KillRange = "0-9", Title = "Zombie Bait" },
+                    new ZombieTitle { KillRange = "10-19", Title = "Novice Survivor" },
+                    new ZombieTitle { KillRange = "20-29", Title = "Grizzled Fighter" },
+                    new ZombieTitle { KillRange = "30-39", Title = "Undead Slayer" },
+                    new ZombieTitle { KillRange = "40-49", Title = "Zombie Hunter" },
+                    new ZombieTitle { KillRange = "50-59", Title = "Apocalypse Survivor" },
+                    new ZombieTitle { KillRange = "60-69", Title = "Zombie Annihilator" },
+                    new ZombieTitle { KillRange = "70-79", Title = "Ultimate Undead Slayer" },
+                    new ZombieTitle { KillRange = "80-89", Title = "Zombie Exterminator" },
+                    new ZombieTitle { KillRange = "90-99", Title = "Legendary Apocalypse Survivor" },
+                    new ZombieTitle { KillRange = "100-109", Title = "Master of the Undead" },
+                    new ZombieTitle { KillRange = "110-119", Title = "Zombie Overlord" },
+                    new ZombieTitle { KillRange = "120-129", Title = "Undead Conqueror" },
+                    new ZombieTitle { KillRange = "130-139", Title = "Lord of the Wasteland" },
+                    new ZombieTitle { KillRange = "140-149", Title = "Dread Reaper" },
+                    new ZombieTitle { KillRange = "150-159", Title = "Vanquisher of the Undead" },
+                    new ZombieTitle { KillRange = "160-169", Title = "Necropolis Dominator" },
+                    new ZombieTitle { KillRange = "170-179", Title = "Champion of the Apocalypse" },
+                    new ZombieTitle { KillRange = "180-189", Title = "Supreme Undead Ruler" },
+                    new ZombieTitle { KillRange = "190-199", Title = "Immortal Zombie Slayer" },
+                    new ZombieTitle { KillRange = "200-209", Title = "Eternal Apocalypse Conqueror" },
+                    new ZombieTitle { KillRange = "210-219", Title = "Mythical Undead Destroyer" },
+                    new ZombieTitle { KillRange = "220-229", Title = "Divine Zombie Vanquisher" },
+                    new ZombieTitle { KillRange = "230-239", Title = "Godlike Apocalypse Champion" },
+                    new ZombieTitle { KillRange = "240-249", Title = "Ultimate Wasteland Hero" },
+                    new ZombieTitle { KillRange = "250-259", Title = "Celestial Undead Master" },
+                    new ZombieTitle { KillRange = "260-269", Title = "Infinite Zombie Annihilator" },
+                    new ZombieTitle { KillRange = "270-279", Title = "Transcendent Apocalypse Warrior" },
+                    new ZombieTitle { KillRange = "280-289", Title = "Ethereal Undead Monarch" },
+                    new ZombieTitle { KillRange = "290-299", Title = "Legendary Eternal Slayer" },
+                    new ZombieTitle { KillRange = "300+", Title = "Apocalyptic Demigod" }
+                };
+
+                int maxIndex = titles.Count - 1;
+                for (int i = 0; i <= maxIndex; i++)
+                {
+                    double progress = (double)i / maxIndex; // Calculate progress from 0 to 1
+
+                    // For the main colour: from darker yellow (255, 204, 0) to bright red (255, 0, 0)
+                    var (colourRgba, colourHex) = GenerateColour(progress, 1.0, 204.0 / 255.0, 0.0, 1.0, 0.0, 0.0);
+                    titles[i].Colour = colourRgba;
+                    titles[i].HexColour = colourHex;
+
+                    // For the name colour: from dark red (139, 0, 0) to bright red (255, 0, 0)
+                    var (nameColourRgba, nameColourHex) = GenerateColour(progress, 139.0 / 255.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+                    titles[i].NameColour = nameColourHex;
+                }
+
+                return titles;
+            }
+        }
+
         internal class ZombieLootTableItem
         {
             public int Index { get; set; }
@@ -1135,21 +1334,23 @@ namespace Oxide.Plugins
 
         internal class PlayerStats
         {
-            public BasePlayer Owner { get; set; }
+            public string Name { get; set; }
 
-            public BaseStats BaseStats { get; set; } = new BaseStats();
+            public DateTime FirstConnection { get; set; }
 
             public PlayerZombieStats ZombieStats { get; set; } = new PlayerZombieStats();
-        }
 
-        internal class BaseStats
-        {
-            public DateTime JoinedTime { get; set; }
+            public override string ToString()
+            {
+                var totalMinutes = DateTime.Now - FirstConnection;
+
+                return $"Time on Server: {Math.Floor(totalMinutes.TotalMinutes)} Minutes\n{ZombieStats}";
+            }
         }
 
         internal class PlayerZombieStats
         {
-            public string Title { get; set; }
+            public ZombieTitle ZombieTitle { get; set; }
 
             public int ZombieKills { get; set; }
 
@@ -1157,13 +1358,18 @@ namespace Oxide.Plugins
 
             public PlayerZombieStats()
             {
-                Title = _zombiePlayerTitles.FirstOrDefault().Value;
+                ZombieTitle = ZombieTitle.GetZombieTitles().FirstOrDefault();
             }
 
             public override string ToString()
             {
                 return $"Zombie Kills: {ZombieKills} \nDeaths by Zombie: {DeathByZombie}";
             }
+        }
+
+        internal class StoredData
+        {
+            public readonly Hash<ulong, PlayerStats> PlayerData = new Hash<ulong, PlayerStats>();
         }
         #endregion
     }
