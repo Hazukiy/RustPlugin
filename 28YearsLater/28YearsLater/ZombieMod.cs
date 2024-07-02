@@ -115,6 +115,7 @@ namespace Oxide.Plugins
 
         private void OnServerInitialized()
         {
+            // Load database
             LoadData();
 
             // Start timer for broadcasting server time
@@ -136,7 +137,6 @@ namespace Oxide.Plugins
             {
                 BuildPlayer(player);
             }
-            SaveData();
 
             // Reload everyone's UI 
             ReloadAllPlayerUI();
@@ -146,7 +146,7 @@ namespace Oxide.Plugins
         {
             BasePlayer player = entity as BasePlayer;
 
-            // Check godmode
+            // Check godmode for player
             if (player != null && player.IsConnected)
             {
                 if (godModePlayers.ContainsKey(player.userID) && godModePlayers[player.userID])
@@ -165,7 +165,15 @@ namespace Oxide.Plugins
                     }
                 }
             }
+
+            // Prevent zombies from being immune in safeareas
+            var isInBandit = entity.triggers?.FirstOrDefault(t => t.name == "BanditZone" || t.name == "SafeZoneLarge");
+            if (entity is ScarecrowNPC && isInBandit != null)
+            {
+                entity.SetHealth(20);
+            }
         }
+
         #endregion
 
         #region Core:Player
@@ -251,6 +259,7 @@ namespace Oxide.Plugins
                     Name = player.displayName,
                     FirstConnection = DateTime.Now
                 });
+                SaveData();
             }
 
             _storedData.PlayerData[player.userID].Name = player.displayName;
@@ -609,6 +618,48 @@ namespace Oxide.Plugins
             "The night seems darker, enveloping you in its embrace.",
             "An ominous feeling settles over the area."
         };
+        private readonly List<string> _zombieBackstories = new List<string>()
+        {
+            "lab assistant at a major pharmaceutical company",
+            "retired corporal with the U.S army",
+            "plumber",
+            "software engineer at a tech startup",
+            "high school chemistry teacher",
+            "mechanic at a local garage",
+            "chef at a five-star restaurant",
+            "nurse at a busy urban hospital",
+            "construction worker",
+            "firefighter",
+            "college professor in history",
+            "freelance graphic designer",
+            "electrician",
+            "taxi driver",
+            "grocery store manager",
+            "journalist for a local newspaper",
+            "bartender at a downtown pub",
+            "real estate agent",
+            "veterinarian",
+            "musician in a rock band",
+            "bank teller",
+            "postal worker",
+            "stay-at-home parent",
+            "airline pilot",
+            "security guard at a shopping mall",
+            "fashion designer",
+            "carpenter",
+            "pharmacist",
+            "dentist",
+            "barista at a coffee shop",
+            "landscaper",
+            "fitness trainer",
+            "marine biologist",
+            "insurance agent",
+            "truck driver",
+            "librarian",
+            "social worker",
+            "civil engineer",
+            "paramedic"
+        };
         private readonly List<ZombieLootTableItem> _zombieLootTable = new List<ZombieLootTableItem>()
         {
             new ZombieLootTableItem() { Index = 0, Name = "scrap", MinAmount = 5, MaxAmount = 10 },
@@ -754,7 +805,7 @@ namespace Oxide.Plugins
             inventory.itemList.Clear();
 
             // Add weapon
-            var itemDef = ItemManager.FindItemDefinition("knife.bone"); // 
+            var itemDef = ItemManager.FindItemDefinition("knife.bone");
             if (itemDef != null)
             {
                 Item weaponItem = ItemManager.CreateByItemID(itemDef.itemid, 1, 1277364396);
@@ -779,7 +830,7 @@ namespace Oxide.Plugins
         #region Hooks and Events
         public void OnCheckZombieRadius(BasePlayer player)
         {
-            if (!player.IsAlive()) return;
+            if (!player.IsAlive() || player.InSafeZone()) return;
 
             // Check amount within radius
             var amountInRadius = GetEntitiesWithinRadius(player.transform.position, MinScanSpawnRadius, ZombiePrefabID);
@@ -823,9 +874,6 @@ namespace Oxide.Plugins
                         corpse.containers[i].AddItem(item, Random.Range(itemIndex.MinAmount, itemIndex.MaxAmount));
                     }
                 }
-
-                // Note: Might be worth doing this, as many corpses can lag the server
-                //corpse.Kill();
                 return corpse;
             }
 
@@ -847,7 +895,9 @@ namespace Oxide.Plugins
                     }
 
                     IncreaseZombieKills(player);
-                    SendPlayerMessage(player, $"You killed {Format(target.displayName, PrimaryRed)}");
+
+                    var randomBackstory = _zombieBackstories[Random.Range(0, _zombieBackstories.Count)];
+                    SendPlayerMessage(player, $"You killed {Format(target.displayName, Green)} who was a {Format(randomBackstory, Green)}");
                 }
             }
         }
@@ -977,7 +1027,8 @@ namespace Oxide.Plugins
 
             SaveData();
 
-            RegenerateUI(player);
+            // Regenerate all UIs
+            ReloadAllPlayerUI();
         }
 
         public int GetZombieKills(BasePlayer player) => _storedData.PlayerData[player.userID]
@@ -1005,6 +1056,9 @@ namespace Oxide.Plugins
             var playerStats = _storedData.PlayerData[player.userID];
             var onlinePlayers = GetOnlinePlayers();
             var panelName = $"{player.userID}-zhud";
+
+            // Increment time on server
+            playerStats.TotalTimePlayed++;
 
             // Add UI
             CuiHelper.AddUi(player, new CuiElementContainer
@@ -1338,13 +1392,13 @@ namespace Oxide.Plugins
 
             public DateTime FirstConnection { get; set; }
 
+            public long TotalTimePlayed { get; set; }
+
             public PlayerZombieStats ZombieStats { get; set; } = new PlayerZombieStats();
 
             public override string ToString()
             {
-                var totalMinutes = DateTime.Now - FirstConnection;
-
-                return $"Time on Server: {Math.Floor(totalMinutes.TotalMinutes)} Minutes\n{ZombieStats}";
+                return $"Time on Server: {TotalTimePlayed} mins\n{ZombieStats}";
             }
         }
 
